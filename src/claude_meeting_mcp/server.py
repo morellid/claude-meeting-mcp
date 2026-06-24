@@ -13,7 +13,13 @@ from pydantic import Field
 from .capture import get_capturer
 from .config import get_config, update_config, validate_config
 from .pv_generator import generate_pv, save_pv
-from .recorder import get_live_status, is_recording, start_recording, stop_recording
+from .recorder import (
+    finalize_live,
+    get_live_status,
+    is_recording,
+    start_recording,
+    stop_recording,
+)
 from .schemas import Transcription
 from .storage import (
     PV_DIR,
@@ -23,7 +29,7 @@ from .storage import (
     list_recordings,
     list_transcriptions,
 )
-from .transcriber import _get_backend, transcribe_meeting
+from .transcriber import _get_backend, save_transcription, transcribe_meeting
 
 mcp = FastMCP(
     "claude-meeting-mcp",
@@ -146,13 +152,22 @@ def audio_status() -> dict:
 @mcp.tool()
 def audio_record_start(
     ctx: Context,
+    live: Annotated[
+        bool,
+        Field(
+            description=(
+                "Accumulate a live transcript during recording (default true), so the "
+                "transcript is ready instantly at stop. Auto-disabled on backends that "
+                "cannot stream (remote API, CPU-only); those fall back to batch at stop."
+            )
+        ),
+    ] = True,
     live_translate: Annotated[
         str | None,
         Field(
             description=(
-                "Enable live translation during recording. "
-                "Set to target language code (e.g. 'en', 'fr', 'es'). "
-                "Translates audio in real-time to a markdown file."
+                "Optional: live TRANSLATION to this language code (e.g. 'fr'). "
+                "Overrides live transcription and writes a translated markdown file."
             )
         ),
     ] = None,
@@ -162,17 +177,20 @@ def audio_record_start(
     Works with: meetings (Meet/Teams/Zoom/Slack/Discord), YouTube videos,
     podcasts, Spotify, lectures, interviews, tutorials — any system audio.
     Also use this to extract text/transcript from a video playing in browser.
-    Stereo WAV: left = system audio, right = microphone.
+    Stereo WAV: left = system audio, right = microphone. By default a live
+    transcript accumulates during recording and is ready instantly at stop.
     With live_translate: translates audio in real-time to a markdown file.
     """
     import asyncio
 
     loop = asyncio.get_event_loop()
-    result = start_recording(live_translate=live_translate, mcp_context=ctx, event_loop=loop)
+    result = start_recording(
+        live=live, live_translate=live_translate, mcp_context=ctx, event_loop=loop
+    )
     if "error" not in result:
         result["next_step"] = "When done, call audio_stop_and_transcribe()"
-        if live_translate:
-            result["next_step"] += " | Check live translation: audio_live_status()"
+        if result.get("live") or result.get("live_translation"):
+            result["next_step"] += " | Check progress: audio_live_status()"
     return _enrich_result(result)
 
 
@@ -191,16 +209,18 @@ def audio_record_stop() -> dict:
 
 @mcp.tool()
 def audio_live_status() -> dict:
-    """Use this to check live translation progress during recording.
+    """Use this to check live transcription/translation progress during recording.
 
-    Returns current translated text, elapsed time, segment count,
-    and the path to the live markdown file.
-    Only works while recording with live_translate enabled.
+    Returns the latest text (committed + current tentative tail), elapsed time,
+    segment count, and the path to the live markdown file. Use this to answer
+    questions about the meeting in real time, before it has stopped.
+    Active while recording with live transcription (default) or live_translate.
     """
     status = get_live_status()
     if status is None:
         return {
-            "error": "No live translation active. Use audio_record_start(live_translate='en')",
+            "error": "No live session active. Recording with live transcription (the default) "
+            "or audio_record_start(live_translate='en') enables this.",
         }
     return status
 
@@ -286,7 +306,28 @@ def audio_stop_and_transcribe(
         return stop_result
 
     file_path = stop_result["file"]
-    return audio_transcribe(file_path, local_speakers, remote_speakers, model)
+    local = local_speakers or "Local"
+    remote = remote_speakers or "Remote"
+
+    # If no model override is requested, prefer the live transcript that already
+    # accumulated during recording — it is ready instantly. A model override is
+    # honoured via the batch path (the live transcript used the live-config model).
+    if model is None:
+        transcription = finalize_live(remote, local)
+        if transcription is not None:
+            save_transcription(transcription, file_path)
+            return _enrich_result(
+                {
+                    "meeting_id": transcription.meeting_id,
+                    "duration_seconds": transcription.duration_seconds,
+                    "segment_count": len(transcription.segments),
+                    "output_file": str(TRANSCRIPTIONS_DIR / f"{transcription.meeting_id}.json"),
+                    "preview": [s.to_dict() for s in transcription.segments[:10]],
+                    "next_step": f"Generate meeting minutes: audio_generate_pv('{transcription.meeting_id}')",
+                }
+            )
+    # No live transcript (gated off, empty, or model override): batch path.
+    return audio_transcribe(file_path, local, remote, model)
 
 
 # --- Retrieval ---

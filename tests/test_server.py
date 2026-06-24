@@ -132,3 +132,56 @@ def test_validate_meeting_id_path_traversal():
     assert _validate_meeting_id("foo/bar") is not None
     assert _validate_meeting_id("foo\\bar") is not None
     assert _validate_meeting_id("") is not None
+
+
+def test_stop_and_transcribe_uses_live_finalize(monkeypatch):
+    import claude_meeting_mcp.server as srv
+    from claude_meeting_mcp.schemas import Segment, Transcription
+
+    monkeypatch.setattr(
+        srv, "stop_recording", lambda: {"status": "stopped", "file": "/x/2026-01-01-m.wav"}
+    )
+
+    t = Transcription(
+        meeting_id="2026-01-01-m", date="2026-01-01", duration_seconds=2.0,
+        speakers={"left": "Remote", "right": "Local"},
+        segments=[Segment(0.0, 1.0, "Remote", "hello")],
+    )
+    monkeypatch.setattr(srv, "finalize_live", lambda r, l: t)
+    monkeypatch.setattr(
+        srv, "save_transcription", lambda tr, wav: srv.TRANSCRIPTIONS_DIR / f"{tr.meeting_id}.json"
+    )
+
+    called = {"batch": False}
+    monkeypatch.setattr(
+        srv, "transcribe_meeting", lambda *a, **k: called.__setitem__("batch", True) or t
+    )
+
+    result = srv.audio_stop_and_transcribe()
+    assert called["batch"] is False  # live finalize used, batch NOT called
+    assert result["meeting_id"] == "2026-01-01-m"
+    assert result["segment_count"] == 1
+
+
+def test_stop_and_transcribe_falls_back_to_batch_when_live_empty(monkeypatch):
+    import claude_meeting_mcp.server as srv
+    from claude_meeting_mcp.schemas import Segment, Transcription
+
+    monkeypatch.setattr(
+        srv, "stop_recording", lambda: {"status": "stopped", "file": "/x/2026-01-01-m.wav"}
+    )
+    monkeypatch.setattr(srv, "finalize_live", lambda r, l: None)  # live produced nothing
+    t = Transcription(
+        meeting_id="2026-01-01-m", date="2026-01-01", duration_seconds=2.0,
+        segments=[Segment(0.0, 1.0, "Remote", "batch")],
+    )
+    called = {"batch": False}
+
+    def fake_batch(*a, **k):
+        called["batch"] = True
+        return t
+
+    monkeypatch.setattr(srv, "transcribe_meeting", fake_batch)
+    result = srv.audio_stop_and_transcribe()
+    assert called["batch"] is True
+    assert result["segment_count"] == 1
