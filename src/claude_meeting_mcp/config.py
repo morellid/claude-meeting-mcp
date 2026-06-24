@@ -68,9 +68,12 @@ class DiarizationConfig:
 @dataclass
 class LiveTranslationConfig:
     target_language: str = "en"  # "en" = Whisper translate, other = MCP Sampling
-    model: str = "medium"  # balance speed/quality for real-time
+    model: str = "large-v3-turbo"  # same model as batch path; fast enough live on MLX
     chunk_seconds: float = 3.0  # how often to transcribe (latency)
     window_seconds: float = 15.0  # audio context for Whisper (quality)
+    commit_hold_seconds: float = 7.0  # commit segments older than this behind the frontier
+    window_max_seconds: float = 30.0  # force-commit cap when speech never pauses
+    commit_policy: str = "hold"  # "hold" or "agreement" (LocalAgreement-2)
 
 
 @dataclass
@@ -139,6 +142,12 @@ def _apply_toml_to_config(config: Config, data: dict[str, Any]) -> None:
             config.live_translation.chunk_seconds = float(lt["chunk_seconds"])
         if "window_seconds" in lt:
             config.live_translation.window_seconds = float(lt["window_seconds"])
+        if "commit_hold_seconds" in lt:
+            config.live_translation.commit_hold_seconds = float(lt["commit_hold_seconds"])
+        if "window_max_seconds" in lt:
+            config.live_translation.window_max_seconds = float(lt["window_max_seconds"])
+        if "commit_policy" in lt:
+            config.live_translation.commit_policy = str(lt["commit_policy"])
 
     if "pv" in data:
         pv = data["pv"]
@@ -215,6 +224,9 @@ def save_config(config: Config) -> Path:
         f'model = "{config.live_translation.model}"',
         f"chunk_seconds = {config.live_translation.chunk_seconds}",
         f"window_seconds = {config.live_translation.window_seconds}",
+        f"commit_hold_seconds = {config.live_translation.commit_hold_seconds}",
+        f"window_max_seconds = {config.live_translation.window_max_seconds}",
+        f'commit_policy = "{config.live_translation.commit_policy}"',
         "",
         "[pv]",
         f"auto_generate = {'true' if config.pv.auto_generate else 'false'}",
@@ -282,6 +294,12 @@ def update_config(key: str, value: str) -> Config:
             config.live_translation.chunk_seconds = float(value)
         elif section == "live_translation" and field_name == "window_seconds":
             config.live_translation.window_seconds = float(value)
+        elif section == "live_translation" and field_name == "commit_hold_seconds":
+            config.live_translation.commit_hold_seconds = float(value)
+        elif section == "live_translation" and field_name == "window_max_seconds":
+            config.live_translation.window_max_seconds = float(value)
+        elif section == "live_translation" and field_name == "commit_policy":
+            config.live_translation.commit_policy = value
         elif section == "pv" and field_name == "auto_generate":
             config.pv.auto_generate = value.lower() in ("true", "1", "yes")
         else:

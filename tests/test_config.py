@@ -214,3 +214,26 @@ def test_update_config_pv_auto_generate(monkeypatch, tmp_path):
 
     updated = update_config("pv.auto_generate", "false")
     assert updated.pv.auto_generate is False
+
+
+def test_live_config_new_fields_defaults():
+    from claude_meeting_mcp.config import Config
+    c = Config()
+    assert c.live_translation.model == "large-v3-turbo"
+    assert c.live_translation.commit_hold_seconds == 7.0
+    assert c.live_translation.window_max_seconds == 30.0
+    assert c.live_translation.commit_policy == "hold"
+
+
+def test_live_config_toml_roundtrip(tmp_path, monkeypatch):
+    import claude_meeting_mcp.config as cfg
+    monkeypatch.setenv("CLAUDE_MEETING_CONFIG_DIR", str(tmp_path))
+    c = cfg.Config()
+    c.live_translation.commit_hold_seconds = 5.0
+    c.live_translation.window_max_seconds = 20.0
+    c.live_translation.commit_policy = "agreement"
+    cfg.save_config(c)
+    loaded = cfg.load_config()
+    assert loaded.live_translation.commit_hold_seconds == 5.0
+    assert loaded.live_translation.window_max_seconds == 20.0
+    assert loaded.live_translation.commit_policy == "agreement"
