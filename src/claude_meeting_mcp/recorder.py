@@ -7,6 +7,7 @@ import threading
 
 from .capture import get_capturer
 from .storage import RECORDINGS_DIR, TRANSCRIPTIONS_DIR, ensure_dirs, generate_filename
+from .transcriber import live_backend_available
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,7 @@ _capturer = None
 _current_file: str | None = None
 _timeout_timer: threading.Timer | None = None
 _live_translator = None
+_live_transcriber = None
 
 
 def _auto_stop() -> None:
@@ -25,16 +27,23 @@ def _auto_stop() -> None:
     stop_recording()
 
 
-def start_recording(live_translate: str | None = None, mcp_context=None, event_loop=None) -> dict:
+def start_recording(
+    live: bool = True,
+    live_translate: str | None = None,
+    mcp_context=None,
+    event_loop=None,
+) -> dict:
     """Start recording system audio + microphone.
 
     Args:
-        live_translate: Target language for live translation (e.g., "en", "fr").
-            None = no live translation.
+        live: Accumulate a live transcript during recording (default on). Auto
+            gated off when no fast local backend is available (remote, CPU-only).
+        live_translate: Optional target language for live TRANSLATION (legacy
+            path via LiveTranslator). When set, takes precedence over `live`.
         mcp_context: MCP Context for sampling-based translation (any lang).
         event_loop: Main asyncio event loop (for thread-safe MCP calls).
     """
-    global _capturer, _current_file, _timeout_timer, _live_translator
+    global _capturer, _current_file, _timeout_timer, _live_translator, _live_transcriber
 
     with _lock:
         if _capturer is not None:
@@ -64,7 +73,7 @@ def start_recording(live_translate: str | None = None, mcp_context=None, event_l
 
         result = {"status": "recording", "file": _current_file}
 
-        # Start live translation if requested
+        # Live path: translation (legacy) takes precedence over transcription.
         if live_translate:
             try:
                 from .config import get_config
@@ -95,13 +104,45 @@ def start_recording(live_translate: str | None = None, mcp_context=None, event_l
             except Exception as e:
                 logger.error("Failed to start live translation: %s", e)
                 result["live_translation_error"] = str(e)
+        elif live:
+            available, reason = live_backend_available()
+            if available:
+                try:
+                    from .config import get_config
+                    from .live_transcriber import LiveTranscriber
+                    from .live_translator import FileAudioSource
+
+                    config = get_config()
+                    meeting_id = filepath.stem
+                    live_file = str(TRANSCRIPTIONS_DIR / f"{meeting_id}_live.md")
+                    source = FileAudioSource(
+                        _current_file,
+                        sample_rate=config.recording.sample_rate,
+                    )
+                    _live_transcriber = LiveTranscriber(source=source, output_path=live_file)
+                    _live_transcriber.start()
+                    result["live"] = True
+                    result["live_file"] = live_file
+                    logger.info("Live transcription started: %s → %s", _current_file, live_file)
+                except Exception as e:
+                    logger.error("Failed to start live transcriber: %s", e)
+                    result["live"] = False
+                    result["live_error"] = str(e)
+            else:
+                result["live"] = False
+                result["live_reason"] = reason
 
         logger.info("Recording started: %s", _current_file)
         return result
 
 
 def stop_recording() -> dict:
-    """Stop current recording."""
+    """Stop current recording.
+
+    Stops the live translator/transcriber daemon thread, but does NOT finalize
+    the live transcript or delete the WAV - finalization happens in
+    finalize_live() so a plain stop leaves the recording intact.
+    """
     global _capturer, _current_file, _timeout_timer, _live_translator
 
     with _lock:
@@ -121,6 +162,14 @@ def stop_recording() -> dict:
                 logger.error("Error stopping live translator: %s", e)
             _live_translator = None
 
+        # Stop live transcriber thread only; keep the reference so finalize_live()
+        # can drain the accumulated transcript afterwards.
+        if _live_transcriber is not None:
+            try:
+                _live_transcriber.stop()
+            except Exception as e:
+                logger.error("Error stopping live transcriber: %s", e)
+
         file_path = _current_file
 
         try:
@@ -137,8 +186,27 @@ def stop_recording() -> dict:
         return {"status": "stopped", "file": file_path}
 
 
+def finalize_live(remote_speakers: str, local_speakers: str):
+    """Finalize the active live transcriber into a Transcription.
+
+    Returns the Transcription, or None if there was no live transcriber or it
+    produced nothing (the caller then falls back to the batch path). Clears the
+    transcriber reference so it is finalized at most once.
+    """
+    global _live_transcriber
+
+    with _lock:
+        transcriber = _live_transcriber
+        _live_transcriber = None
+    if transcriber is None:
+        return None
+    return transcriber.finalize(remote_speakers, local_speakers)
+
+
 def get_live_status() -> dict | None:
-    """Get live translation status, or None if not active."""
+    """Get live transcription/translation status, or None if not active."""
+    if _live_transcriber is not None:
+        return _live_transcriber.get_status()
     if _live_translator is not None:
         return _live_translator.get_status()
     return None

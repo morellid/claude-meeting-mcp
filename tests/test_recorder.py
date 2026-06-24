@@ -17,7 +17,9 @@ def test_start_stop_lifecycle(mock_get, tmp_path):
     mock_capturer.is_available.return_value = True
     mock_get.return_value = mock_capturer
 
-    result = start_recording()
+    # live=False: this test covers the start/stop lifecycle only, not the live
+    # transcriber daemon (which would otherwise spin up on backends that support it).
+    result = start_recording(live=False)
     assert result["status"] == "recording"
     assert "file" in result
 
@@ -69,3 +71,27 @@ def test_get_capturer_returns_macos():
 
         capturer = get_capturer()
         assert isinstance(capturer, MacOSCapturer)
+
+
+def test_start_recording_gates_live_off_for_remote(monkeypatch):
+    import claude_meeting_mcp.recorder as rec
+
+    class FakeCap:
+        def is_available(self):
+            return True
+
+        def start(self, path):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(rec, "_capturer", None)
+    monkeypatch.setattr(rec, "_current_file", None)
+    monkeypatch.setattr(rec, "get_capturer", lambda: FakeCap())
+    monkeypatch.setattr(rec, "live_backend_available", lambda: (False, "remote"))
+    result = rec.start_recording(live=True)
+    assert result["status"] == "recording"
+    assert result.get("live") is False
+    assert "remote" in result.get("live_reason", "")
+    rec.stop_recording()
