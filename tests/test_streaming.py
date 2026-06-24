@@ -61,6 +61,23 @@ def test_agreement_policy_requires_two_matching_ticks():
     assert [h.text for h in ch.committed] == ["hello world"]
 
 
+def test_agreement_aligns_after_partial_commit():
+    """After a partial commit, agreement must compare the remaining segment against
+    the retained uncommitted suffix - not a stale, already-committed index."""
+    ch = StreamingChannel(commit_hold_seconds=2.0, commit_policy="agreement")
+    # Tick 1: first sighting, nothing agrees yet.
+    ch.update([seg(0.0, 4.0, "alpha"), seg(4.0, 9.5, "beta")], frontier_abs=10.0)
+    assert ch.committed == []
+    # Tick 2: alpha aged + agrees -> commits; beta still too recent -> held.
+    ch.update([seg(0.0, 4.0, "alpha"), seg(4.0, 9.5, "beta")], frontier_abs=10.5)
+    assert [h.text for h in ch.committed] == ["alpha"]
+    assert [h.text for h in ch.tentative_segs] == ["beta"]
+    # Tick 3: buffer trimmed to 4.0s; beta re-seen at rel 0..5.5 (abs 4..9.5), aged.
+    # It must agree with the retained suffix and commit, not stall.
+    ch.update([seg(0.0, 5.5, "beta")], frontier_abs=12.0)
+    assert [h.text for h in ch.committed] == ["alpha", "beta"]
+
+
 def test_flush_commits_everything():
     """flush() commits all remaining segments regardless of age (used at stop)."""
     ch = StreamingChannel(commit_hold_seconds=7.0)

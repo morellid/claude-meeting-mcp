@@ -82,7 +82,9 @@ class StreamingChannel:
             self.buffer_start_abs = newly[-1].end
 
         self.tentative_segs = abs_segs[commit_idx:]
-        self._prev = abs_segs
+        # Keep only the still-uncommitted suffix so the next tick's agreement check
+        # (compared by index) lines up with this tick's remaining segments.
+        self._prev = self.tentative_segs
         return self.buffer_start_abs
 
     def flush(self, rel_segments: list[dict]) -> None:
