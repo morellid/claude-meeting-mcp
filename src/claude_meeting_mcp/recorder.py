@@ -61,6 +61,11 @@ def start_recording(
         try:
             capturer.start(_current_file)
             _capturer = capturer
+            # A new recording is live: discard any live transcriber/translator left
+            # over from a previous session that was stopped but never finalized, so
+            # finalize_live() can never drain a stale transcript into this WAV.
+            _live_transcriber = None
+            _live_translator = None
         except RuntimeError as e:
             logger.error("Failed to start recording: %s", e)
             _current_file = None

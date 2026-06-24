@@ -95,3 +95,36 @@ def test_start_recording_gates_live_off_for_remote(monkeypatch):
     assert result.get("live") is False
     assert "remote" in result.get("live_reason", "")
     rec.stop_recording()
+
+
+def test_new_recording_clears_stale_live_transcriber(monkeypatch):
+    """A live transcriber left over from a stopped-but-not-finalized session must
+    not be finalized into a later recording's WAV (would delete the new WAV)."""
+    import claude_meeting_mcp.recorder as rec
+
+    class FakeCap:
+        def is_available(self):
+            return True
+
+        def start(self, path):
+            pass
+
+        def stop(self):
+            pass
+
+    class StaleTranscriber:
+        def finalize(self, remote, local):
+            raise AssertionError("stale transcriber must never be finalized")
+
+    monkeypatch.setattr(rec, "_capturer", None)
+    monkeypatch.setattr(rec, "_current_file", None)
+    monkeypatch.setattr(rec, "get_capturer", lambda: FakeCap())
+    # Previous session: stopped (thread halted) but finalize_live() was never called.
+    monkeypatch.setattr(rec, "_live_transcriber", StaleTranscriber())
+
+    result = rec.start_recording(live=False)
+    assert result["status"] == "recording"
+    assert rec._live_transcriber is None
+    # Nothing stale to drain -> caller falls back to the batch path.
+    assert rec.finalize_live("Remote", "Local") is None
+    rec.stop_recording()
