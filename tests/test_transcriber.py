@@ -143,3 +143,40 @@ def test_transcribe_channel_faster_dispatch(mock_backend):
         mock_faster.assert_called_once()
         assert len(result) == 1
         assert result[0]["text"] == "test faster"
+
+
+def test_live_backend_unavailable_for_remote(monkeypatch):
+    import claude_meeting_mcp.transcriber as tr
+    monkeypatch.setattr(tr, "_get_backend", lambda: "remote")
+    ok, reason = tr.live_backend_available()
+    assert ok is False
+    assert "remote" in reason.lower()
+
+
+def test_live_backend_available_for_mlx(monkeypatch):
+    import claude_meeting_mcp.transcriber as tr
+    monkeypatch.setattr(tr, "_get_backend", lambda: "mlx")
+    ok, _ = tr.live_backend_available()
+    assert ok is True
+
+
+def test_save_transcription_writes_json_and_deletes_wav(tmp_path, monkeypatch):
+    import soundfile as sf
+    import claude_meeting_mcp.transcriber as tr
+    from claude_meeting_mcp.transcriber import save_transcription
+    from claude_meeting_mcp.schemas import Segment, Transcription
+
+    # Redirect the binding the function actually uses (imported by value).
+    monkeypatch.setattr(tr, "TRANSCRIPTIONS_DIR", tmp_path)
+    monkeypatch.setattr(tr, "ensure_dirs", lambda: None)
+
+    wav = tmp_path / "2026-01-01-meeting.wav"
+    sf.write(str(wav), np.zeros((10, 2), dtype="float32"), 48000)
+    t = Transcription(
+        meeting_id="2026-01-01-meeting", date="2026-01-01", duration_seconds=1.0,
+        speakers={"left": "Remote", "right": "Local"},
+        segments=[Segment(0.0, 1.0, "Remote", "hi")],
+    )
+    out = save_transcription(t, str(wav))
+    assert out.exists()
+    assert not wav.exists()  # WAV deleted only after the JSON is saved

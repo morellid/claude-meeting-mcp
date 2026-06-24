@@ -161,6 +161,48 @@ def _can_parallelize() -> bool:
     return False
 
 
+def live_backend_available() -> tuple[bool, str]:
+    """Decide whether live incremental transcription can run on this machine.
+
+    Live transcription runs Whisper on-device every few seconds, so it needs a
+    fast LOCAL backend. Remote APIs and CPU-only setups fall back to the batch
+    path. Returns (available, reason).
+    """
+    backend = _get_backend()
+    if backend == "remote":
+        return False, "live transcription needs a local backend; remote mode uses batch at stop"
+    if backend == "mlx":
+        return True, "mlx"
+    if backend == "faster":
+        try:
+            import ctranslate2
+
+            if ctranslate2.get_cuda_device_count() > 0:
+                return True, "faster-whisper (CUDA)"
+        except Exception:
+            pass
+        return False, "faster-whisper on CPU is too slow for real time; using batch at stop"
+    return False, "no local whisper backend available"
+
+
+def save_transcription(transcription: Transcription, wav_path: str | None) -> Path:
+    """Save a Transcription JSON and delete the source WAV (only after the save).
+
+    Shared by the batch path and the live finalize path so deletion ordering is
+    identical: the WAV is removed only once a transcript is safely on disk.
+    """
+    ensure_dirs()
+    output_path = TRANSCRIPTIONS_DIR / f"{transcription.meeting_id}.json"
+    output_path.write_text(transcription.to_json(), encoding="utf-8")
+    if wav_path:
+        try:
+            Path(wav_path).unlink()
+            logger.info("Deleted WAV after transcription: %s", wav_path)
+        except OSError as e:
+            logger.warning("Could not delete WAV: %s", e)
+    return output_path
+
+
 def _ensure_faster_model() -> None:
     """Ensure faster-whisper model is loaded (for parallelization check)."""
     global _faster_model, _faster_model_name
