@@ -22,6 +22,10 @@ from .streaming import Hyp, StreamingChannel
 logger = logging.getLogger(__name__)
 
 _SILENCE_RMS = 0.001
+# At stop we transcribe whatever audio remains in a channel buffer exactly once,
+# so we can afford a much smaller floor than the per-tick 1s guard - this keeps a
+# short final utterance from being silently dropped.
+_MIN_FINALIZE_SECONDS = 0.2
 
 
 class LiveTranscriber:
@@ -110,9 +114,15 @@ class LiveTranscriber:
             cap = int(self._chan[channel].window_max_seconds * self._sr)
             if len(buf) > cap:
                 with self._lock:
+                    ch = self._chan[channel]
+                    # Commit any uncommitted speech before discarding the buffer,
+                    # otherwise a long trailing silence would erase it.
+                    if ch.tentative_segs:
+                        ch.committed.extend(ch.tentative_segs)
+                        ch.tentative_segs = []
                     self._buf[channel] = np.empty(0, np.float32)
                     self._buf_start_sample[channel] = self._total_samples
-                    self._chan[channel].buffer_start_abs = frontier_abs
+                    ch.buffer_start_abs = frontier_abs
             return
         # _transcribe is slow (seconds) and must run WITHOUT the lock; only the
         # fast commit-state mutation below is locked against get_status().
@@ -152,10 +162,19 @@ class LiveTranscriber:
 
     def finalize(self, remote_speakers: str, local_speakers: str) -> Transcription | None:
         """Flush remaining tails and merge both channels. None if nothing committed."""
+        # Drain any audio written after the daemon stopped - notably the frames the
+        # capturer flushes during stop_recording - so the meeting's tail is not lost.
+        left, right = self._source.get_new_audio_both()
+        if left is not None and len(left) > 0:
+            self._total_samples += len(left)
+            self._buf["left"] = np.concatenate([self._buf["left"], left])
+            self._buf["right"] = np.concatenate([self._buf["right"], right])
+
         frontier_abs = self._total_samples / self._sr
+        min_tail = int(_MIN_FINALIZE_SECONDS * self._sr)
         for channel in ("left", "right"):
             buf = self._buf[channel]
-            if len(buf) >= self._sr:
+            if len(buf) >= min_tail:
                 rms = float(np.sqrt(np.mean(buf**2)))
                 if rms >= _SILENCE_RMS:
                     self._chan[channel].flush(self._transcribe(buf, channel))
