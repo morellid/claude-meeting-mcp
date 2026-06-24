@@ -316,14 +316,15 @@ def audio_stop_and_transcribe(
         transcription = finalize_live(remote, local)
         if transcription is not None:
             save_transcription(transcription, file_path)
+            mid = transcription.meeting_id
             return _enrich_result(
                 {
-                    "meeting_id": transcription.meeting_id,
+                    "meeting_id": mid,
                     "duration_seconds": transcription.duration_seconds,
                     "segment_count": len(transcription.segments),
-                    "output_file": str(TRANSCRIPTIONS_DIR / f"{transcription.meeting_id}.json"),
+                    "output_file": str(TRANSCRIPTIONS_DIR / f"{mid}.json"),
                     "preview": [s.to_dict() for s in transcription.segments[:10]],
-                    "next_step": f"Generate meeting minutes: audio_generate_pv('{transcription.meeting_id}')",
+                    "next_step": f"Generate meeting minutes: audio_generate_pv('{mid}')",
                 }
             )
     # No live transcript (gated off, empty, or model override): batch path.

@@ -145,7 +145,7 @@ def test_file_audio_source_reads_both_channels(tmp_path):
     sf.write(wav_path, np.column_stack([left, right]), sr, subtype="PCM_16")
 
     source = FileAudioSource(wav_path, sample_rate=sr, channels=2)
-    l, r = source.get_new_audio_both()
-    assert l is not None and r is not None
-    assert len(l) == len(r) > 0
-    assert l.mean() > 0.4 and r.mean() < -0.4
+    left_out, right_out = source.get_new_audio_both()
+    assert left_out is not None and right_out is not None
+    assert len(left_out) == len(right_out) > 0
+    assert left_out.mean() > 0.4 and right_out.mean() < -0.4

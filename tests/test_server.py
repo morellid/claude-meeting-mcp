@@ -147,7 +147,7 @@ def test_stop_and_transcribe_uses_live_finalize(monkeypatch):
         speakers={"left": "Remote", "right": "Local"},
         segments=[Segment(0.0, 1.0, "Remote", "hello")],
     )
-    monkeypatch.setattr(srv, "finalize_live", lambda r, l: t)
+    monkeypatch.setattr(srv, "finalize_live", lambda remote, local: t)
     monkeypatch.setattr(
         srv, "save_transcription", lambda tr, wav: srv.TRANSCRIPTIONS_DIR / f"{tr.meeting_id}.json"
     )
@@ -170,7 +170,7 @@ def test_stop_and_transcribe_falls_back_to_batch_when_live_empty(monkeypatch):
     monkeypatch.setattr(
         srv, "stop_recording", lambda: {"status": "stopped", "file": "/x/2026-01-01-m.wav"}
     )
-    monkeypatch.setattr(srv, "finalize_live", lambda r, l: None)  # live produced nothing
+    monkeypatch.setattr(srv, "finalize_live", lambda remote, local: None)  # live produced nothing
     t = Transcription(
         meeting_id="2026-01-01-m", date="2026-01-01", duration_seconds=2.0,
         segments=[Segment(0.0, 1.0, "Remote", "batch")],

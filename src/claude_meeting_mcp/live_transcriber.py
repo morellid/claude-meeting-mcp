@@ -166,8 +166,9 @@ class LiveTranscriber:
 
         segments: list[Segment] = []
         for channel in ("left", "right"):
+            label = labels[channel]
             for h in self._chan[channel].committed:
-                segments.append(Segment(round(h.start, 2), round(h.end, 2), labels[channel], h.text))
+                segments.append(Segment(round(h.start, 2), round(h.end, 2), label, h.text))
         if not segments:
             return None
         segments.sort(key=lambda s: s.start)
@@ -211,7 +212,10 @@ class LiveTranscriber:
 
     def _write_markdown(self, final: bool = False) -> None:
         elapsed = time.monotonic() - self._start_time
-        status = "Completed" if final else f"Recording ({int(elapsed // 60)}m {int(elapsed % 60):02d}s)"
+        if final:
+            status = "Completed"
+        else:
+            status = f"Recording ({int(elapsed // 60)}m {int(elapsed % 60):02d}s)"
         running = self._running_transcript()
         lines = ["# Live Transcript", f"**Status**: {status}", "", "---", ""]
         for h in running:

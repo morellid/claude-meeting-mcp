@@ -162,9 +162,10 @@ def test_live_backend_available_for_mlx(monkeypatch):
 
 def test_save_transcription_writes_json_and_deletes_wav(tmp_path, monkeypatch):
     import soundfile as sf
+
     import claude_meeting_mcp.transcriber as tr
-    from claude_meeting_mcp.transcriber import save_transcription
     from claude_meeting_mcp.schemas import Segment, Transcription
+    from claude_meeting_mcp.transcriber import save_transcription
 
     # Redirect the binding the function actually uses (imported by value).
     monkeypatch.setattr(tr, "TRANSCRIPTIONS_DIR", tmp_path)

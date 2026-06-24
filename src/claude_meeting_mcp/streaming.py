@@ -42,7 +42,9 @@ class StreamingChannel:
             text = s["text"].strip()
             if not text:
                 continue
-            out.append(Hyp(s["start"] + self.buffer_start_abs, s["end"] + self.buffer_start_abs, text))
+            start = s["start"] + self.buffer_start_abs
+            end = s["end"] + self.buffer_start_abs
+            out.append(Hyp(start, end, text))
         return out
 
     def _agrees(self, i: int, seg: Hyp) -> bool:
