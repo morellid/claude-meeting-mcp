@@ -120,7 +120,10 @@ required.
 Owns the daemon thread, a `DualChannelSource`, and two `StreamingChannel`s.
 
 - Each tick: pull `(left_new, right_new)` from the source, feed each channel, RMS-gate
-  silence so an idle channel costs zero GPU, write the live markdown.
+  silence so an idle channel costs zero GPU, write the live markdown. The live markdown
+  holds the **full accumulated committed transcript plus the tentative tail** (not a
+  window), so it is a complete running transcript Claude can read to answer questions
+  mid-meeting, before `stop`.
 - Self-pacing: if a tick takes longer than `chunk_seconds` (for example both channels
   busy on sequential MLX), skip the sleep and continue immediately to avoid backlog.
 - `stop()`: stop the thread, transcribe each channel's remaining tail once, commit
@@ -129,9 +132,10 @@ Owns the daemon thread, a `DualChannelSource`, and two `StreamingChannel`s.
 
 ### 4. Server glue (`server.py`, `recorder.py`)
 
-- `audio_record_start(live=...)`: starts a `LiveTranscriber`. `live` defaults to
-  **on**; pass `live=false` for pure capture. `live_translate` kept as a back-compat
-  alias.
+- `audio_record_start(live=...)`: starts a `LiveTranscriber` when a fast local backend
+  is available (see "Compatibility and capability gating"). `live` defaults to **on**
+  but transparently falls back to record-then-batch when it cannot run; pass
+  `live=false` to force pure capture. `live_translate` kept as a back-compat alias.
 - `audio_stop_and_transcribe(...)`: if a live transcriber is active, **finalize from
   it** (sub-second) instead of calling `transcribe_meeting`; otherwise the batch path,
   unchanged. Speaker names are still supplied here.
@@ -197,7 +201,64 @@ Extend the existing `[live_translation]` block (keep its keys working):
   default for the no-wait transcript use case.
 - Diarization stays off; channels give the speaker split.
 
-`live` defaults to on for `audio_record_start`.
+`live` defaults to on for `audio_record_start`, subject to the capability gate below.
+It never errors; it falls back to record-then-batch when a fast local backend is not
+available.
+
+## Compatibility and capability gating
+
+`live` defaulting to on must never degrade or break a configuration that does not match
+how we use it (local MLX on Apple Silicon). The live loop is intrinsically
+local-and-fast: it runs Whisper on the device every few seconds. That is fine for MLX or
+CUDA, but wrong for other setups. So "default on" means **on when a fast local backend is
+available; otherwise transparently fall back to today's record-then-batch behaviour, with
+no error.**
+
+A `_live_available()` check decides at `audio_record_start`:
+
+- `transcription.mode == "remote"`: live OFF. Per-tick calls to a remote API every few
+  seconds, per channel, are impractical (latency, rate limits, cost), and the live path
+  has no remote code path at all. Record normally; the existing remote batch pass runs at
+  `stop`. The result reports `live=false` with a reason.
+- `mode == "local"`, MLX present (macOS Apple Silicon): live ON. This is our case.
+- `mode == "local"`, faster-whisper on CUDA: live ON.
+- `mode == "local"`, faster-whisper on CPU only: live OFF by default (a large model on
+  CPU will not keep up with real time). Allowed only via an explicit `live=true` override.
+- No local whisper backend installed: live OFF (the batch path's own error handling is
+  unchanged).
+
+When live is gated off, `audio_record_start` still records and simply does not start the
+transcriber; `audio_stop_and_transcribe` runs the batch path exactly as today. Nothing the
+user relies on changes.
+
+If faster-whisper is used live, the model must be cached across ticks (reuse the
+transcriber's `_ensure_faster_model`), not reloaded each tick as the current live path
+does.
+
+Cross-platform note: all three capture backends already write a growing stereo WAV (macOS
+audiocap; Linux and Windows flush every 500ms), so `DualChannelSource` works on every
+platform the recorder supports - live is not macOS-only. It is simply less battle-tested on
+Windows/Linux, so those stay behind the same capability gate and fall back cleanly.
+
+## Edge cases and regression guards
+
+- **`audio_record_stop` (stop without transcribe) with live active:** stop the live
+  thread, but do NOT finalize or delete the WAV. A subsequent `audio_transcribe(file)` runs
+  the batch path on the intact WAV. The live work is discarded; nothing breaks.
+- **Explicit `model` override passed to `audio_stop_and_transcribe`:** the live transcript
+  was produced with the live-config model, so honouring an override means preferring the
+  batch path. If a model override is supplied, finalize via batch, not from live.
+- **WAV deletion ordering:** only the finalize/transcribe step deletes the WAV, and only
+  after a non-empty `Transcription` is saved. Stopping the live thread never deletes
+  anything.
+- **Schema parity:** finalize-from-live builds the exact same `Transcription` object
+  (including the `speakers` dict) as the batch path, so `get_transcription`,
+  `transcriptions_list`, and PV generation are unaffected.
+- **Non-meeting captures (YouTube, podcast, music):** the mic/right channel is silent and
+  RMS-gated, so only the system/left channel transcribes. Works; the only cost is local GPU
+  use for the duration, the accepted trade-off of default-on.
+- **`DualChannelSource` on a mono recording:** defensively duplicate the single channel (as
+  `split_channels` already does), though tool-made recordings are always stereo.
 
 ## Quality mitigations
 
