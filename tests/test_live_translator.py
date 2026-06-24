@@ -131,3 +131,21 @@ def test_live_translator_stop_writes_final(tmp_path):
     content = Path(output).read_text()
     assert "Completed" in content
     assert "translating..." not in content.lower()
+
+
+def test_file_audio_source_reads_both_channels(tmp_path):
+    """get_new_audio_both returns distinct left and right channels."""
+    import soundfile as sf
+
+    wav_path = str(tmp_path / "stereo.wav")
+    sr = 48000
+    n = sr  # 1 second
+    left = np.full(n, 0.5, dtype=np.float32)
+    right = np.full(n, -0.5, dtype=np.float32)
+    sf.write(wav_path, np.column_stack([left, right]), sr, subtype="PCM_16")
+
+    source = FileAudioSource(wav_path, sample_rate=sr, channels=2)
+    l, r = source.get_new_audio_both()
+    assert l is not None and r is not None
+    assert len(l) == len(r) > 0
+    assert l.mean() > 0.4 and r.mean() < -0.4

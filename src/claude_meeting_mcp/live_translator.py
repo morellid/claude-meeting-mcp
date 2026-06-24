@@ -117,6 +117,39 @@ class FileAudioSource:
         except OSError:
             return None
 
+    def get_new_audio_both(self) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        """Return (left, right) new samples since last call, or (None, None).
+
+        Reuses the same byte-offset bookkeeping as get_new_audio but keeps both
+        channels. Mono input is duplicated so callers always get two channels.
+        """
+        if not os.path.exists(self._path):
+            return None, None
+        if self._data_offset is None:
+            self._data_offset = self._find_data_offset()
+            if self._data_offset is None:
+                return None, None
+            self._read_offset = 0
+        try:
+            file_size = os.path.getsize(self._path)
+            available = file_size - self._data_offset - self._read_offset
+            available = (available // self._frame_size) * self._frame_size
+            if available <= 0:
+                return None, None
+            max_bytes = self._sample_rate * 5 * self._frame_size
+            read_size = min(available, max_bytes)
+            with open(self._path, "rb") as f:
+                f.seek(self._data_offset + self._read_offset)
+                raw = f.read(read_size)
+            self._read_offset += len(raw)
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if self._channels > 1:
+                frames = samples.reshape(-1, self._channels)
+                return np.ascontiguousarray(frames[:, 0]), np.ascontiguousarray(frames[:, 1])
+            return samples, samples.copy()
+        except OSError:
+            return None, None
+
     def get_sample_rate(self) -> int:
         return self._sample_rate
 
