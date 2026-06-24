@@ -160,6 +160,19 @@ def test_live_backend_available_for_mlx(monkeypatch):
     assert ok is True
 
 
+def test_live_backend_available_handles_missing_backend(monkeypatch):
+    """If no whisper backend is installed, gating must report unavailable, not raise."""
+    import claude_meeting_mcp.transcriber as tr
+
+    def boom():
+        raise RuntimeError("No whisper backend available.")
+
+    monkeypatch.setattr(tr, "_get_backend", boom)
+    ok, reason = tr.live_backend_available()
+    assert ok is False
+    assert "backend" in reason.lower()
+
+
 def test_save_transcription_writes_json_and_deletes_wav(tmp_path, monkeypatch):
     import soundfile as sf
 

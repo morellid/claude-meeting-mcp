@@ -168,7 +168,11 @@ def live_backend_available() -> tuple[bool, str]:
     fast LOCAL backend. Remote APIs and CPU-only setups fall back to the batch
     path. Returns (available, reason).
     """
-    backend = _get_backend()
+    try:
+        backend = _get_backend()
+    except Exception as e:
+        # No whisper backend installed at all: never let this abort a recording.
+        return False, f"no transcription backend available: {e}"
     if backend == "remote":
         return False, "live transcription needs a local backend; remote mode uses batch at stop"
     if backend == "mlx":
