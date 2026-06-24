@@ -111,6 +111,23 @@ def test_silent_cap_preserves_tentative(tmp_path):
     assert len(lt._buf["left"]) == 0
 
 
+def test_finalize_falls_back_when_worker_still_running(tmp_path):
+    """If the daemon could not be joined, finalize() must not race its buffers -
+    it returns None so the caller does a clean batch pass instead."""
+    from claude_meeting_mcp.streaming import Hyp
+
+    sr = 48000
+    lt = LiveTranscriber(source=FakeSource([], sr=sr), output_path=str(tmp_path / "live.md"))
+
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    lt._thread = AliveThread()
+    lt._chan["left"].committed = [Hyp(0.0, 1.0, "x")]  # even with content already in
+    assert lt.finalize("Remote", "Local") is None
+
+
 def test_live_markdown_has_full_transcript(tmp_path, monkeypatch):
     sr = 48000
     src = FakeSource([(loud(sr), loud(sr))], sr=sr)

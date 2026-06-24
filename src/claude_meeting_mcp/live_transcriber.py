@@ -72,8 +72,14 @@ class LiveTranscriber:
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=10)
-            self._thread = None
+            # Generous join: a single tick is bounded by its transcription time.
+            # Clear the handle only on a clean stop, so finalize() can detect a
+            # worker that is somehow still alive and avoid racing its buffers.
+            self._thread.join(timeout=60)
+            if self._thread.is_alive():
+                logger.error("Live transcriber thread did not stop within 60s")
+            else:
+                self._thread = None
 
     def _run(self) -> None:
         time.sleep(2.0)  # let audio start flowing
@@ -162,6 +168,12 @@ class LiveTranscriber:
 
     def finalize(self, remote_speakers: str, local_speakers: str) -> Transcription | None:
         """Flush remaining tails and merge both channels. None if nothing committed."""
+        # The daemon exclusively owns _buf / _total_samples while it runs. If stop()
+        # could not join it, do NOT race its buffers - return None so the caller falls
+        # back to a clean batch pass over the (already complete) WAV instead.
+        if self._thread is not None and self._thread.is_alive():
+            logger.error("Live transcriber still running at finalize; using batch fallback")
+            return None
         # Drain any audio written after the daemon stopped - notably the frames the
         # capturer flushes during stop_recording - so the meeting's tail is not lost.
         left, right = self._source.get_new_audio_both()
