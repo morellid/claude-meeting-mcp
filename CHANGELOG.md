@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- **Live incremental transcription**: the transcript is ready the instant you stop
+  recording. A dual-channel (remote/local), append-only commit-boundary transcriber
+  runs during the recording, so `audio_stop_and_transcribe()` returns in ~1s instead
+  of waiting for a full batch pass. On by default for `audio_record_start`.
+- **Real-time queries**: `audio_live_status()` exposes the running transcript
+  (committed + tentative tail) while recording, so you can ask about the meeting
+  before it ends.
+- Auto-fallback to batch transcription on backends that cannot stream in real time
+  (remote API, CPU-only faster-whisper); the live path is gated on a fast local
+  backend so the feature never degrades the product on those setups.
+
 ## [0.3.0] - 2026-04-15
 
 ### Added
