@@ -195,6 +195,24 @@ def _resample_to_16k(audio: np.ndarray, samplerate: int) -> np.ndarray:
     return resample(audio, new_length).astype(np.float32)
 
 
+# A channel whose RMS sits below this (~-60 dBFS) carries no usable speech, so we
+# skip transcribing it rather than spend minutes on silence. Deliberately
+# conservative: real speech sits far higher (~-25 dBFS), and the asymmetry favours
+# caution - failing to skip only wastes time, whereas skipping a channel with real
+# (quiet) speech would silently drop content. This catches a genuinely silent
+# channel (e.g. a muted mic while recording a video); it does NOT catch a loud
+# channel that merely lacks speech (noise/hum) - that would need VAD.
+SILENCE_RMS_THRESHOLD = 1e-3
+
+
+def _channel_is_silent(audio: np.ndarray, threshold: float = SILENCE_RMS_THRESHOLD) -> bool:
+    """True if a channel's RMS energy is below the silence threshold."""
+    if audio.size == 0:
+        return True
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+    return rms < threshold
+
+
 def transcribe_channel(audio: np.ndarray, samplerate: int, model: str | None = None) -> list[dict]:
     """Transcribe a single audio channel using the configured backend."""
     # Resample to 16kHz — Whisper is trained on 16kHz and internal resampling
@@ -313,29 +331,52 @@ def transcribe_meeting(
     t0 = time.monotonic()
     backend = _get_backend()
 
+    # Skip channels that are silent - no point spending minutes transcribing silence.
+    # On MLX (sequential) this halves the time for one-sided sessions, e.g. a muted
+    # mic while recording a video.
+    left_silent = _channel_is_silent(left_audio)
+    right_silent = _channel_is_silent(right_audio)
+    if left_silent:
+        logger.info("System (left) channel is silent - skipping transcription")
+    if right_silent:
+        logger.info("Mic (right) channel is silent - skipping transcription")
+
     if backend == "remote":
-        left_tmp = _save_channel_temp(left_audio, samplerate, "left")
-        right_tmp = _save_channel_temp(right_audio, samplerate, "right")
+        left_segments, right_segments = [], []
+        left_tmp = right_tmp = None
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fl = pool.submit(_transcribe_remote_channel, left_tmp, "left")
-                fr = pool.submit(_transcribe_remote_channel, right_tmp, "right")
-                left_segments = fl.result()
-                right_segments = fr.result()
+                fl = fr = None
+                if not left_silent:
+                    left_tmp = _save_channel_temp(left_audio, samplerate, "left")
+                    fl = pool.submit(_transcribe_remote_channel, left_tmp, "left")
+                if not right_silent:
+                    right_tmp = _save_channel_temp(right_audio, samplerate, "right")
+                    fr = pool.submit(_transcribe_remote_channel, right_tmp, "right")
+                if fl is not None:
+                    left_segments = fl.result()
+                if fr is not None:
+                    right_segments = fr.result()
         finally:
-            os.unlink(left_tmp)
-            os.unlink(right_tmp)
+            if left_tmp is not None:
+                os.unlink(left_tmp)
+            if right_tmp is not None:
+                os.unlink(right_tmp)
     elif _can_parallelize():
         logger.info("Parallel transcription (backend=%s)", backend)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            fl = pool.submit(transcribe_channel, left_audio, samplerate, model)
-            fr = pool.submit(transcribe_channel, right_audio, samplerate, model)
-            left_segments = fl.result()
-            right_segments = fr.result()
+            fl = None
+            fr = None
+            if not left_silent:
+                fl = pool.submit(transcribe_channel, left_audio, samplerate, model)
+            if not right_silent:
+                fr = pool.submit(transcribe_channel, right_audio, samplerate, model)
+            left_segments = fl.result() if fl is not None else []
+            right_segments = fr.result() if fr is not None else []
     else:
         logger.info("Sequential transcription (backend=%s)", backend)
-        left_segments = transcribe_channel(left_audio, samplerate, model)
-        right_segments = transcribe_channel(right_audio, samplerate, model)
+        left_segments = [] if left_silent else transcribe_channel(left_audio, samplerate, model)
+        right_segments = [] if right_silent else transcribe_channel(right_audio, samplerate, model)
 
     # Apply diarization if enabled
     if config.diarization.enabled:
