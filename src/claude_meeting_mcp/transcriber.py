@@ -54,19 +54,35 @@ def _get_backend(mode_override: str | None = None) -> str:
     )
 
 
-def _transcribe_mlx(audio: np.ndarray, samplerate: int, model: str | None = None) -> list[dict]:
+def _resolve_language(language: str | None) -> str | None:
+    """Map the configured language to a Whisper language code, or None for auto-detect.
+
+    "auto"/""/"none" (any case) mean: let Whisper detect the language per channel.
+    Forcing the wrong language produces garbage AND is ~4x slower (temperature
+    fallback re-decoding), so auto-detect is the safe default for bilingual use.
+    """
+    normalized = (language or "").strip()
+    if not normalized or normalized.lower() in ("auto", "none"):
+        return None
+    return normalized
+
+
+def _transcribe_mlx(
+    audio: np.ndarray, samplerate: int, model: str | None = None, prompt: str | None = None
+) -> list[dict]:
     """Transcribe audio with MLX-Whisper (macOS Apple Silicon)."""
     import mlx_whisper
 
     config = get_config()
     model_id = get_mlx_model_id(model or config.transcription.model)
-    language = config.transcription.language
+    language = _resolve_language(config.transcription.language)
 
     audio = audio.astype(np.float32, copy=False)
     result = mlx_whisper.transcribe(
         audio,
         path_or_hf_repo=model_id,
         language=language,
+        initial_prompt=prompt,
         word_timestamps=True,
         condition_on_previous_text=False,
         hallucination_silence_threshold=1.0,
@@ -76,14 +92,16 @@ def _transcribe_mlx(audio: np.ndarray, samplerate: int, model: str | None = None
     return result.get("segments", [])
 
 
-def _transcribe_faster(audio: np.ndarray, samplerate: int, model: str | None = None) -> list[dict]:
+def _transcribe_faster(
+    audio: np.ndarray, samplerate: int, model: str | None = None, prompt: str | None = None
+) -> list[dict]:
     """Transcribe audio with faster-whisper (CPU/CUDA)."""
     global _faster_model, _faster_model_name
     from faster_whisper import WhisperModel
 
     config = get_config()
     model_id = get_faster_model_id(model or config.transcription.model)
-    language = config.transcription.language
+    language = _resolve_language(config.transcription.language)
 
     # Cache model singleton (reload if model changed)
     if _faster_model is None or _faster_model_name != model_id:
@@ -94,6 +112,7 @@ def _transcribe_faster(audio: np.ndarray, samplerate: int, model: str | None = N
     segments_gen, info = _faster_model.transcribe(
         audio,
         language=language,
+        initial_prompt=prompt,
         word_timestamps=False,
         vad_filter=True,
     )
@@ -122,16 +141,22 @@ def _transcribe_remote_channel(wav_path: str, channel: str = "left") -> list[dic
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    data = {
+        "model": config.transcription.model,
+        "response_format": "verbose_json",
+    }
+    # Omit "language" entirely for auto-detect; the OpenAI-compatible API
+    # detects the language when the field is absent.
+    language = _resolve_language(config.transcription.language)
+    if language:
+        data["language"] = language
+
     with open(wav_path, "rb") as f:
         response = httpx.post(
             url,
             headers=headers,
             files={"file": (f"audio_{channel}.wav", f, "audio/wav")},
-            data={
-                "model": config.transcription.model,
-                "language": config.transcription.language,
-                "response_format": "verbose_json",
-            },
+            data=data,
             timeout=300.0,
         )
 
@@ -195,7 +220,52 @@ def _resample_to_16k(audio: np.ndarray, samplerate: int) -> np.ndarray:
     return resample(audio, new_length).astype(np.float32)
 
 
-def transcribe_channel(audio: np.ndarray, samplerate: int, model: str | None = None) -> list[dict]:
+# A channel whose RMS sits below this (~-60 dBFS) carries no usable speech, so we
+# skip transcribing it rather than spend minutes on silence. Deliberately
+# conservative: real speech sits far higher (~-25 dBFS), and the asymmetry favours
+# caution - failing to skip only wastes time, whereas skipping a channel with real
+# (quiet) speech would silently drop content. This catches a genuinely silent
+# channel (e.g. a muted mic while recording a video); it does NOT catch a loud
+# channel that merely lacks speech (noise/hum) - that would need VAD.
+SILENCE_RMS_THRESHOLD = 1e-3
+
+
+def _channel_is_silent(audio: np.ndarray, threshold: float = SILENCE_RMS_THRESHOLD) -> bool:
+    """True if a channel's RMS energy is below the silence threshold."""
+    if audio.size == 0:
+        return True
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+    return rms < threshold
+
+
+def _build_name_prompt(*speaker_lists: str | None) -> str | None:
+    """Build a Whisper initial_prompt that biases toward known participant names.
+
+    Names are passed verbatim as a spelling hint so Whisper transcribes them
+    correctly (e.g. "Davide", "Nadeem"). Placeholder labels ("Remote"/"Local")
+    and blanks are ignored. Returns None when no real names are available.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw in speaker_lists:
+        if not raw:
+            continue
+        for name in raw.split(","):
+            name = name.strip()
+            if not name or name in ("Remote", "Local"):
+                continue
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                names.append(name)
+    if not names:
+        return None
+    return ", ".join(names)
+
+
+def transcribe_channel(
+    audio: np.ndarray, samplerate: int, model: str | None = None, prompt: str | None = None
+) -> list[dict]:
     """Transcribe a single audio channel using the configured backend."""
     # Resample to 16kHz — Whisper is trained on 16kHz and internal resampling
     # from 48kHz can produce artifacts/hallucinations
@@ -203,9 +273,9 @@ def transcribe_channel(audio: np.ndarray, samplerate: int, model: str | None = N
     backend = _get_backend()
 
     if backend == "mlx":
-        return _transcribe_mlx(audio, WHISPER_SAMPLE_RATE, model)
+        return _transcribe_mlx(audio, WHISPER_SAMPLE_RATE, model, prompt)
     elif backend == "faster":
-        return _transcribe_faster(audio, WHISPER_SAMPLE_RATE, model)
+        return _transcribe_faster(audio, WHISPER_SAMPLE_RATE, model, prompt)
     else:
         raise RuntimeError("Remote backend should not call transcribe_channel directly")
 
@@ -313,29 +383,64 @@ def transcribe_meeting(
     t0 = time.monotonic()
     backend = _get_backend()
 
+    # Skip channels that are silent - no point spending minutes transcribing silence.
+    # On MLX (sequential) this halves the time for one-sided sessions, e.g. a muted
+    # mic while recording a video.
+    left_silent = _channel_is_silent(left_audio)
+    right_silent = _channel_is_silent(right_audio)
+    if left_silent:
+        logger.info("System (left) channel is silent - skipping transcription")
+    if right_silent:
+        logger.info("Mic (right) channel is silent - skipping transcription")
+
+    # Bias Whisper toward known participant names so it spells them right.
+    # Both channels get the FULL name list on purpose: in conversation people
+    # address each other by name across channels ("Thanks, Nadeem"), so a name
+    # can be spoken on either side. Remote path keeps its own contract, untouched.
+    name_prompt = _build_name_prompt(remote_speakers, local_speakers)
+    if name_prompt:
+        logger.info("Biasing transcription toward names: %s", name_prompt)
+
     if backend == "remote":
-        left_tmp = _save_channel_temp(left_audio, samplerate, "left")
-        right_tmp = _save_channel_temp(right_audio, samplerate, "right")
+        left_segments, right_segments = [], []
+        left_tmp = right_tmp = None
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fl = pool.submit(_transcribe_remote_channel, left_tmp, "left")
-                fr = pool.submit(_transcribe_remote_channel, right_tmp, "right")
-                left_segments = fl.result()
-                right_segments = fr.result()
+                fl = fr = None
+                if not left_silent:
+                    left_tmp = _save_channel_temp(left_audio, samplerate, "left")
+                    fl = pool.submit(_transcribe_remote_channel, left_tmp, "left")
+                if not right_silent:
+                    right_tmp = _save_channel_temp(right_audio, samplerate, "right")
+                    fr = pool.submit(_transcribe_remote_channel, right_tmp, "right")
+                if fl is not None:
+                    left_segments = fl.result()
+                if fr is not None:
+                    right_segments = fr.result()
         finally:
-            os.unlink(left_tmp)
-            os.unlink(right_tmp)
+            if left_tmp is not None:
+                os.unlink(left_tmp)
+            if right_tmp is not None:
+                os.unlink(right_tmp)
     elif _can_parallelize():
         logger.info("Parallel transcription (backend=%s)", backend)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            fl = pool.submit(transcribe_channel, left_audio, samplerate, model)
-            fr = pool.submit(transcribe_channel, right_audio, samplerate, model)
-            left_segments = fl.result()
-            right_segments = fr.result()
+            fl = None
+            fr = None
+            if not left_silent:
+                fl = pool.submit(transcribe_channel, left_audio, samplerate, model, name_prompt)
+            if not right_silent:
+                fr = pool.submit(transcribe_channel, right_audio, samplerate, model, name_prompt)
+            left_segments = fl.result() if fl is not None else []
+            right_segments = fr.result() if fr is not None else []
     else:
         logger.info("Sequential transcription (backend=%s)", backend)
-        left_segments = transcribe_channel(left_audio, samplerate, model)
-        right_segments = transcribe_channel(right_audio, samplerate, model)
+        left_segments = (
+            [] if left_silent else transcribe_channel(left_audio, samplerate, model, name_prompt)
+        )
+        right_segments = (
+            [] if right_silent else transcribe_channel(right_audio, samplerate, model, name_prompt)
+        )
 
     # Apply diarization if enabled
     if config.diarization.enabled:
@@ -362,9 +467,13 @@ def transcribe_meeting(
         segments=segments,
     )
 
-    # Save JSON
+    # Save JSON atomically: write to a temp file then rename, so a reader (e.g. the
+    # background-job disk fallback) never sees a half-written transcript if the
+    # process is killed mid-write.
     output_path = TRANSCRIPTIONS_DIR / f"{meeting_id}.json"
-    output_path.write_text(transcription.to_json(), encoding="utf-8")
+    tmp_path = output_path.with_suffix(".json.tmp")
+    tmp_path.write_text(transcription.to_json(), encoding="utf-8")
+    os.replace(tmp_path, output_path)
 
     # Delete WAV after successful transcription — no longer needed
     try:

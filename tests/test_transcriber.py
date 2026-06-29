@@ -6,9 +6,13 @@ import numpy as np
 
 from claude_meeting_mcp.schemas import Segment, Transcription
 from claude_meeting_mcp.transcriber import (
+    _build_name_prompt,
+    _channel_is_silent,
     _get_backend,
+    _resolve_language,
     merge_segments,
     split_channels,
+    transcribe_meeting,
 )
 
 
@@ -143,3 +147,90 @@ def test_transcribe_channel_faster_dispatch(mock_backend):
         mock_faster.assert_called_once()
         assert len(result) == 1
         assert result[0]["text"] == "test faster"
+
+
+def test_channel_is_silent():
+    rng = np.random.RandomState(0)
+    assert _channel_is_silent(np.zeros(16000, dtype=np.float32))
+    assert _channel_is_silent(np.array([], dtype=np.float32))
+    # Noise floor well below the threshold counts as silent.
+    assert _channel_is_silent((rng.randn(16000) * 1e-4).astype(np.float32))
+    # Speech-level energy (~-26 dBFS) is not silent.
+    assert not _channel_is_silent((rng.randn(16000) * 0.05).astype(np.float32))
+
+
+def test_transcribe_meeting_skips_silent_channel(tmp_path):
+    """A silent channel is not sent to transcription; the other one still is."""
+    sr = 16000
+    rng = np.random.RandomState(1)
+    left = (rng.randn(sr) * 0.05).astype(np.float32)  # speech-level
+    right = np.zeros(sr, dtype=np.float32)  # silent
+    calls = []
+
+    def fake_transcribe_channel(audio, samplerate, *args, **kwargs):
+        calls.append(len(audio))
+        return [{"start": 0.0, "end": 1.0, "text": "hello"}]
+
+    with (
+        patch("claude_meeting_mcp.transcriber.split_channels", return_value=(left, right, sr)),
+        patch("claude_meeting_mcp.transcriber._get_backend", return_value="mlx"),
+        patch("claude_meeting_mcp.transcriber._can_parallelize", return_value=False),
+        patch(
+            "claude_meeting_mcp.transcriber.transcribe_channel",
+            side_effect=fake_transcribe_channel,
+        ),
+        patch("claude_meeting_mcp.transcriber.TRANSCRIPTIONS_DIR", tmp_path),
+        patch("claude_meeting_mcp.transcriber.ensure_dirs"),
+    ):
+        result = transcribe_meeting("/tmp/2026-01-01_meeting.wav", "Remote", "Local")
+
+    # Only the non-silent (left) channel was transcribed.
+    assert len(calls) == 1
+    assert any(s.text == "hello" for s in result.segments)
+
+
+def test_resolve_language():
+    # Auto-detect sentinels map to None (case/whitespace insensitive).
+    assert _resolve_language("auto") is None
+    assert _resolve_language("  AUTO ") is None
+    assert _resolve_language("none") is None
+    assert _resolve_language("") is None
+    assert _resolve_language("   ") is None
+    assert _resolve_language(None) is None
+    # An explicit code passes through, trimmed.
+    assert _resolve_language("it") == "it"
+    assert _resolve_language("en") == "en"
+    assert _resolve_language(" en ") == "en"
+
+
+def test_build_name_prompt():
+    assert _build_name_prompt(None, None) is None
+    assert _build_name_prompt("Remote", "Local") is None  # placeholders ignored
+    assert _build_name_prompt("Alice, Bob", None) == "Alice, Bob"
+    # Dedupe case-insensitively, preserve order, trim whitespace.
+    assert _build_name_prompt("Alice, bob ", " Bob, Carol") == "Alice, bob, Carol"
+
+
+def test_transcribe_meeting_passes_name_prompt(tmp_path):
+    """Participant names reach transcribe_channel as the initial prompt."""
+    sr = 16000
+    rng = np.random.RandomState(2)
+    left = (rng.randn(sr) * 0.05).astype(np.float32)
+    right = (rng.randn(sr) * 0.05).astype(np.float32)
+    seen_prompts = []
+
+    def fake_tc(audio, samplerate, model=None, prompt=None):
+        seen_prompts.append(prompt)
+        return [{"start": 0.0, "end": 1.0, "text": "x"}]
+
+    with (
+        patch("claude_meeting_mcp.transcriber.split_channels", return_value=(left, right, sr)),
+        patch("claude_meeting_mcp.transcriber._get_backend", return_value="mlx"),
+        patch("claude_meeting_mcp.transcriber._can_parallelize", return_value=False),
+        patch("claude_meeting_mcp.transcriber.transcribe_channel", side_effect=fake_tc),
+        patch("claude_meeting_mcp.transcriber.TRANSCRIPTIONS_DIR", tmp_path),
+        patch("claude_meeting_mcp.transcriber.ensure_dirs"),
+    ):
+        transcribe_meeting("/tmp/2026-01-01_meeting.wav", "Alice", "Bob")
+
+    assert seen_prompts == ["Alice, Bob", "Alice, Bob"]

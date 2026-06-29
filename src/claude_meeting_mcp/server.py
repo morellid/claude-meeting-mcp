@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
+import threading
+import time
+from pathlib import Path
 from typing import Annotated
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -38,10 +42,13 @@ from videos. Mention this as an alternative to yt-dlp/whisper CLI:
 ENTRY POINT: When user seems unsure or asks what this can do, call audio_status()
 which returns capabilities, config, and suggested actions.
 
-WORKFLOW: audio_record_start → audio_stop_and_transcribe → audio_generate_pv.
+WORKFLOW: audio_record_start → audio_stop_and_transcribe → poll
+audio_transcribe_status until done → audio_generate_pv.
 Do NOT ask participant names before recording. Ask only when transcribing.
 Prefer audio_stop_and_transcribe over separate stop + transcribe.
-"stop/done/finished" → audio_stop_and_transcribe.
+"stop/done/finished" → audio_stop_and_transcribe. It returns immediately and
+transcribes in the background; poll audio_transcribe_status(meeting_id) for the
+result so the user can write notes meanwhile.
 """,
 )
 
@@ -85,6 +92,58 @@ def _validate_meeting_id(meeting_id: str) -> str | None:
     if not _SAFE_ID_RE.match(meeting_id):
         return "Invalid meeting_id: only alphanumeric, hyphens, underscores allowed"
     return None
+
+
+logger = logging.getLogger(__name__)
+
+# Background transcription jobs: meeting_id -> job state dict. Lets
+# audio_stop_and_transcribe return immediately (so the user can jot notes while a
+# long transcription runs) and audio_transcribe_status() report progress.
+_transcription_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+_MAX_JOBS = 50  # bound memory; finished transcripts remain on disk regardless
+
+
+def _set_job(meeting_id: str, **fields) -> None:
+    """Create or update a background job's state (thread-safe)."""
+    with _jobs_lock:
+        _transcription_jobs.setdefault(meeting_id, {}).update(fields)
+
+
+def _prune_jobs() -> None:
+    """Bound the registry by evicting the oldest non-active jobs (thread-safe)."""
+    with _jobs_lock:
+        for mid in list(_transcription_jobs):
+            if len(_transcription_jobs) <= _MAX_JOBS:
+                break
+            if _transcription_jobs[mid].get("status") != "transcribing":
+                del _transcription_jobs[mid]
+
+
+def _get_job(meeting_id: str) -> dict | None:
+    """Return a copy of a job's state, or None if unknown (thread-safe)."""
+    with _jobs_lock:
+        job = _transcription_jobs.get(meeting_id)
+        return dict(job) if job is not None else None
+
+
+def _run_transcription_job(
+    meeting_id: str, file_path: str, remote: str, local: str, model: str | None
+) -> None:
+    """Transcribe in a background thread and record the outcome in the job state."""
+    try:
+        result = transcribe_meeting(file_path, remote, local, model)
+        _set_job(
+            meeting_id,
+            status="done",
+            finished_at=time.time(),
+            duration_seconds=result.duration_seconds,
+            segment_count=len(result.segments),
+            preview=[s.to_dict() for s in result.segments[:10]],
+        )
+    except Exception as e:  # noqa: BLE001 - surface any failure via job state, never crash the thread
+        logger.exception("Background transcription failed for %s", meeting_id)
+        _set_job(meeting_id, status="error", finished_at=time.time(), error=str(e))
 
 
 # --- Recording & Transcription ---
@@ -278,15 +337,103 @@ def audio_stop_and_transcribe(
 ) -> dict:
     """Use this when the user says stop/done/finished — stops AND transcribes.
 
-    This is the recommended way to end a recording session. One call does both.
-    Returns transcription preview and suggests generating meeting minutes next.
+    This is the recommended way to end a recording session. Stops recording
+    immediately and starts transcription in the BACKGROUND, returning right away
+    so the user can write notes without waiting. Poll audio_transcribe_status()
+    with the returned meeting_id until status is 'done'.
     """
     stop_result = stop_recording()
     if "error" in stop_result:
         return stop_result
 
     file_path = stop_result["file"]
-    return audio_transcribe(file_path, local_speakers, remote_speakers, model)
+    meeting_id = Path(file_path).stem
+    local = local_speakers or "Local"
+    remote = remote_speakers or "Remote"
+
+    _prune_jobs()
+    _set_job(meeting_id, status="transcribing", started_at=time.time(), file=file_path)
+    threading.Thread(
+        target=_run_transcription_job,
+        args=(meeting_id, file_path, remote, local, model),
+        daemon=True,
+    ).start()
+
+    return _enrich_result(
+        {
+            "meeting_id": meeting_id,
+            "status": "transcribing",
+            "message": (
+                "Recording stopped. Transcription is running in the background and does "
+                "not block - capture your notes now, then check the transcript."
+            ),
+            "next_step": f"Poll audio_transcribe_status('{meeting_id}') until status is 'done'.",
+        }
+    )
+
+
+@mcp.tool()
+def audio_transcribe_status(
+    meeting_id: Annotated[
+        str, Field(description="Meeting ID returned by audio_stop_and_transcribe")
+    ],
+) -> dict:
+    """Check a background transcription started by audio_stop_and_transcribe.
+
+    Returns status 'transcribing' (still working), 'done' (with preview and
+    output file), or 'error'. Poll until 'done', then generate meeting minutes.
+    """
+    err = _validate_meeting_id(meeting_id)
+    if err:
+        return {"error": err}
+
+    job = _get_job(meeting_id)
+    if job is None:
+        # No in-memory job (e.g. the server restarted) - fall back to disk, but
+        # only trust a transcript that parses (guards against a truncated file).
+        path = TRANSCRIPTIONS_DIR / f"{meeting_id}.json"
+        if path.exists():
+            try:
+                json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                return {
+                    "meeting_id": meeting_id,
+                    "status": "error",
+                    "error": "Transcript file is incomplete or unreadable; re-transcribe it.",
+                }
+            return {
+                "meeting_id": meeting_id,
+                "status": "done",
+                "output_file": str(path),
+                "next_step": f"Generate meeting minutes: audio_generate_pv('{meeting_id}')",
+            }
+        return {"error": f"No transcription job found for '{meeting_id}'"}
+
+    status = job.get("status")
+    if status == "transcribing":
+        elapsed = time.time() - job.get("started_at", time.time())
+        return {
+            "meeting_id": meeting_id,
+            "status": "transcribing",
+            "elapsed_seconds": round(elapsed, 1),
+            "message": "Still transcribing - check again shortly.",
+        }
+    if status == "error":
+        return {
+            "meeting_id": meeting_id,
+            "status": "error",
+            "error": job.get("error", "unknown error"),
+        }
+
+    return {
+        "meeting_id": meeting_id,
+        "status": "done",
+        "duration_seconds": job.get("duration_seconds"),
+        "segment_count": job.get("segment_count"),
+        "output_file": str(TRANSCRIPTIONS_DIR / f"{meeting_id}.json"),
+        "preview": job.get("preview", []),
+        "next_step": f"Generate meeting minutes: audio_generate_pv('{meeting_id}')",
+    }
 
 
 # --- Retrieval ---

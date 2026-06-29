@@ -1,6 +1,7 @@
 """Tests for server module."""
 
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 
@@ -132,3 +133,95 @@ def test_validate_meeting_id_path_traversal():
     assert _validate_meeting_id("foo/bar") is not None
     assert _validate_meeting_id("foo\\bar") is not None
     assert _validate_meeting_id("") is not None
+
+
+def _fake_transcription(meeting_id):
+    from claude_meeting_mcp.schemas import Segment, Transcription
+
+    return Transcription(
+        meeting_id=meeting_id,
+        date=meeting_id[:10],
+        duration_seconds=12.3,
+        segments=[Segment(start=0.0, end=1.0, speaker="Alice", text="hello")],
+    )
+
+
+def _poll_until_settled(meeting_id, timeout=5.0):
+    """Poll audio_transcribe_status until the background job leaves 'transcribing'."""
+    from claude_meeting_mcp.server import audio_transcribe_status
+
+    deadline = time.monotonic() + timeout
+    status = audio_transcribe_status(meeting_id)
+    while status.get("status") == "transcribing" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = audio_transcribe_status(meeting_id)
+    return status
+
+
+def test_stop_and_transcribe_is_nonblocking_then_done():
+    """stop_and_transcribe returns immediately; status reaches done with a preview."""
+    meeting_id = "2026-01-02_test-nonblocking"
+    with (
+        patch(
+            "claude_meeting_mcp.server.stop_recording",
+            return_value={"file": f"/tmp/{meeting_id}.wav"},
+        ),
+        patch(
+            "claude_meeting_mcp.server.transcribe_meeting",
+            return_value=_fake_transcription(meeting_id),
+        ) as mock_tm,
+    ):
+        from claude_meeting_mcp.server import audio_stop_and_transcribe
+
+        result = audio_stop_and_transcribe(local_speakers="Alice", remote_speakers="Bob")
+        # Returned right away, before transcription finished.
+        assert result["status"] == "transcribing"
+        assert result["meeting_id"] == meeting_id
+
+        status = _poll_until_settled(meeting_id)
+        assert status["status"] == "done"
+        assert status["segment_count"] == 1
+        assert status["preview"]
+        # Names were forwarded to the transcription call.
+        args, _ = mock_tm.call_args
+        assert args[1] == "Bob" and args[2] == "Alice"
+
+
+def test_transcribe_status_reports_error():
+    """A failing background transcription surfaces as status 'error'."""
+    meeting_id = "2026-01-03_test-error"
+    with (
+        patch(
+            "claude_meeting_mcp.server.stop_recording",
+            return_value={"file": f"/tmp/{meeting_id}.wav"},
+        ),
+        patch(
+            "claude_meeting_mcp.server.transcribe_meeting",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        from claude_meeting_mcp.server import audio_stop_and_transcribe
+
+        audio_stop_and_transcribe()
+        status = _poll_until_settled(meeting_id)
+        assert status["status"] == "error"
+        assert "boom" in status["error"]
+
+
+def test_transcribe_status_disk_fallback(tmp_path):
+    """With no in-memory job, status falls back to an existing transcript on disk."""
+    with patch("claude_meeting_mcp.server.TRANSCRIPTIONS_DIR", tmp_path):
+        from claude_meeting_mcp.server import audio_transcribe_status
+
+        # Unknown job, no file -> error.
+        assert "error" in audio_transcribe_status("2099-01-01_unknown")
+
+        # Unknown job, valid file present -> done.
+        (tmp_path / "2099-01-01_ondisk.json").write_text("{}", encoding="utf-8")
+        status = audio_transcribe_status("2099-01-01_ondisk")
+        assert status["status"] == "done"
+
+        # Unknown job, truncated/unparseable file -> error, not a false "done".
+        (tmp_path / "2099-01-01_partial.json").write_text('{"segments": [', encoding="utf-8")
+        status = audio_transcribe_status("2099-01-01_partial")
+        assert status["status"] == "error"
