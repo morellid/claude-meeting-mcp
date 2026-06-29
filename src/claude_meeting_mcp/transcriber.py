@@ -375,7 +375,9 @@ def transcribe_meeting(
         logger.info("Mic (right) channel is silent - skipping transcription")
 
     # Bias Whisper toward known participant names so it spells them right.
-    # Remote path keeps its own contract and is left untouched.
+    # Both channels get the FULL name list on purpose: in conversation people
+    # address each other by name across channels ("Thanks, Nadeem"), so a name
+    # can be spoken on either side. Remote path keeps its own contract, untouched.
     name_prompt = _build_name_prompt(remote_speakers, local_speakers)
     if name_prompt:
         logger.info("Biasing transcription toward names: %s", name_prompt)
@@ -446,9 +448,13 @@ def transcribe_meeting(
         segments=segments,
     )
 
-    # Save JSON
+    # Save JSON atomically: write to a temp file then rename, so a reader (e.g. the
+    # background-job disk fallback) never sees a half-written transcript if the
+    # process is killed mid-write.
     output_path = TRANSCRIPTIONS_DIR / f"{meeting_id}.json"
-    output_path.write_text(transcription.to_json(), encoding="utf-8")
+    tmp_path = output_path.with_suffix(".json.tmp")
+    tmp_path.write_text(transcription.to_json(), encoding="utf-8")
+    os.replace(tmp_path, output_path)
 
     # Delete WAV after successful transcription — no longer needed
     try:

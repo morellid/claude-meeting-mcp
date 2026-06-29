@@ -101,12 +101,23 @@ logger = logging.getLogger(__name__)
 # long transcription runs) and audio_transcribe_status() report progress.
 _transcription_jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+_MAX_JOBS = 50  # bound memory; finished transcripts remain on disk regardless
 
 
 def _set_job(meeting_id: str, **fields) -> None:
     """Create or update a background job's state (thread-safe)."""
     with _jobs_lock:
         _transcription_jobs.setdefault(meeting_id, {}).update(fields)
+
+
+def _prune_jobs() -> None:
+    """Bound the registry by evicting the oldest non-active jobs (thread-safe)."""
+    with _jobs_lock:
+        for mid in list(_transcription_jobs):
+            if len(_transcription_jobs) <= _MAX_JOBS:
+                break
+            if _transcription_jobs[mid].get("status") != "transcribing":
+                del _transcription_jobs[mid]
 
 
 def _get_job(meeting_id: str) -> dict | None:
@@ -340,6 +351,7 @@ def audio_stop_and_transcribe(
     local = local_speakers or "Local"
     remote = remote_speakers or "Remote"
 
+    _prune_jobs()
     _set_job(meeting_id, status="transcribing", started_at=time.time(), file=file_path)
     threading.Thread(
         target=_run_transcription_job,
@@ -377,9 +389,18 @@ def audio_transcribe_status(
 
     job = _get_job(meeting_id)
     if job is None:
-        # No in-memory job (e.g. the server restarted) - fall back to disk.
+        # No in-memory job (e.g. the server restarted) - fall back to disk, but
+        # only trust a transcript that parses (guards against a truncated file).
         path = TRANSCRIPTIONS_DIR / f"{meeting_id}.json"
         if path.exists():
+            try:
+                json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                return {
+                    "meeting_id": meeting_id,
+                    "status": "error",
+                    "error": "Transcript file is incomplete or unreadable; re-transcribe it.",
+                }
             return {
                 "meeting_id": meeting_id,
                 "status": "done",

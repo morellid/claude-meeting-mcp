@@ -216,7 +216,12 @@ def test_transcribe_status_disk_fallback(tmp_path):
         # Unknown job, no file -> error.
         assert "error" in audio_transcribe_status("2099-01-01_unknown")
 
-        # Unknown job, file present -> done.
+        # Unknown job, valid file present -> done.
         (tmp_path / "2099-01-01_ondisk.json").write_text("{}", encoding="utf-8")
         status = audio_transcribe_status("2099-01-01_ondisk")
         assert status["status"] == "done"
+
+        # Unknown job, truncated/unparseable file -> error, not a false "done".
+        (tmp_path / "2099-01-01_partial.json").write_text('{"segments": [', encoding="utf-8")
+        status = audio_transcribe_status("2099-01-01_partial")
+        assert status["status"] == "error"
