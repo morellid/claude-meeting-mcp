@@ -49,7 +49,7 @@ class TranscriptionConfig:
     """Transcription settings. Local uses Whisper (mlx/faster), remote uses any compatible API."""
 
     model: str = "large-v3-turbo"
-    language: str = "en"
+    language: str = "auto"  # "auto" = detect per channel; or a code like "it"/"en"
     mode: str = "local"  # "local" (Whisper on device) or "remote" (API)
     remote: TranscriptionRemoteConfig = field(default_factory=TranscriptionRemoteConfig)
 

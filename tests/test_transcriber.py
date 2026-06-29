@@ -9,6 +9,7 @@ from claude_meeting_mcp.transcriber import (
     _build_name_prompt,
     _channel_is_silent,
     _get_backend,
+    _resolve_language,
     merge_segments,
     split_channels,
     transcribe_meeting,
@@ -186,6 +187,20 @@ def test_transcribe_meeting_skips_silent_channel(tmp_path):
     # Only the non-silent (left) channel was transcribed.
     assert len(calls) == 1
     assert any(s.text == "hello" for s in result.segments)
+
+
+def test_resolve_language():
+    # Auto-detect sentinels map to None (case/whitespace insensitive).
+    assert _resolve_language("auto") is None
+    assert _resolve_language("  AUTO ") is None
+    assert _resolve_language("none") is None
+    assert _resolve_language("") is None
+    assert _resolve_language("   ") is None
+    assert _resolve_language(None) is None
+    # An explicit code passes through, trimmed.
+    assert _resolve_language("it") == "it"
+    assert _resolve_language("en") == "en"
+    assert _resolve_language(" en ") == "en"
 
 
 def test_build_name_prompt():

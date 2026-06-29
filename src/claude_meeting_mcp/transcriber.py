@@ -54,6 +54,19 @@ def _get_backend(mode_override: str | None = None) -> str:
     )
 
 
+def _resolve_language(language: str | None) -> str | None:
+    """Map the configured language to a Whisper language code, or None for auto-detect.
+
+    "auto"/""/"none" (any case) mean: let Whisper detect the language per channel.
+    Forcing the wrong language produces garbage AND is ~4x slower (temperature
+    fallback re-decoding), so auto-detect is the safe default for bilingual use.
+    """
+    normalized = (language or "").strip()
+    if not normalized or normalized.lower() in ("auto", "none"):
+        return None
+    return normalized
+
+
 def _transcribe_mlx(
     audio: np.ndarray, samplerate: int, model: str | None = None, prompt: str | None = None
 ) -> list[dict]:
@@ -62,7 +75,7 @@ def _transcribe_mlx(
 
     config = get_config()
     model_id = get_mlx_model_id(model or config.transcription.model)
-    language = config.transcription.language
+    language = _resolve_language(config.transcription.language)
 
     audio = audio.astype(np.float32, copy=False)
     result = mlx_whisper.transcribe(
@@ -88,7 +101,7 @@ def _transcribe_faster(
 
     config = get_config()
     model_id = get_faster_model_id(model or config.transcription.model)
-    language = config.transcription.language
+    language = _resolve_language(config.transcription.language)
 
     # Cache model singleton (reload if model changed)
     if _faster_model is None or _faster_model_name != model_id:
@@ -128,16 +141,22 @@ def _transcribe_remote_channel(wav_path: str, channel: str = "left") -> list[dic
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    data = {
+        "model": config.transcription.model,
+        "response_format": "verbose_json",
+    }
+    # Omit "language" entirely for auto-detect; the OpenAI-compatible API
+    # detects the language when the field is absent.
+    language = _resolve_language(config.transcription.language)
+    if language:
+        data["language"] = language
+
     with open(wav_path, "rb") as f:
         response = httpx.post(
             url,
             headers=headers,
             files={"file": (f"audio_{channel}.wav", f, "audio/wav")},
-            data={
-                "model": config.transcription.model,
-                "language": config.transcription.language,
-                "response_format": "verbose_json",
-            },
+            data=data,
             timeout=300.0,
         )
 

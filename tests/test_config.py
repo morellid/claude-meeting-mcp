@@ -21,7 +21,7 @@ from claude_meeting_mcp.config import (
 def test_default_config():
     config = Config()
     assert config.transcription.model == "large-v3-turbo"
-    assert config.transcription.language == "en"
+    assert config.transcription.language == "auto"
     assert config.transcription.mode == "local"
     assert config.recording.sample_rate == 48000
     assert config.diarization.enabled is False
