@@ -48,7 +48,8 @@ Do NOT ask participant names before recording. Ask only when transcribing.
 Prefer audio_stop_and_transcribe over separate stop + transcribe.
 "stop/done/finished" → audio_stop_and_transcribe. It returns immediately and
 transcribes in the background; poll audio_transcribe_status(meeting_id) for the
-result so the user can write notes meanwhile.
+result so the user can write notes meanwhile. audio_transcribe (existing file on
+disk) is background too - same polling.
 """,
 )
 
@@ -294,22 +295,42 @@ def audio_transcribe(
 ) -> dict:
     """Use this to transcribe a WAV file that already exists on disk.
 
-    For recordings just made, use audio_stop_and_transcribe() instead.
-    Works on any audio: meetings, YouTube, podcasts, lectures, interviews.
-    Splits stereo channels for speaker attribution. With diarization,
-    identifies individual speakers within each channel.
+    Starts transcription in the BACKGROUND and returns right away; poll
+    audio_transcribe_status() with the returned meeting_id until status is
+    'done'. Works on any audio: meetings, YouTube, podcasts, lectures,
+    interviews. Splits stereo channels for speaker attribution. With
+    diarization, identifies individual speakers within each channel.
     """
+    wav = Path(file_path)
+    if not wav.is_file():
+        return {"error": f"File not found: {file_path}"}
+
+    # Never transcribe inline. On MLX the two channels run sequentially at
+    # roughly 1x real time each, so a two-sided recording costs ~2x its duration
+    # - past the MCP client's idle timeout for anything but a very short file,
+    # which kills the call and loses the work. Same background job as
+    # audio_stop_and_transcribe.
+    meeting_id = wav.stem
     local = local_speakers or "Local"
     remote = remote_speakers or "Remote"
-    result = transcribe_meeting(file_path, remote, local, model)
+
+    _prune_jobs()
+    _set_job(meeting_id, status="transcribing", started_at=time.time(), file=file_path)
+    threading.Thread(
+        target=_run_transcription_job,
+        args=(meeting_id, file_path, remote, local, model),
+        daemon=True,
+    ).start()
+
     return _enrich_result(
         {
-            "meeting_id": result.meeting_id,
-            "duration_seconds": result.duration_seconds,
-            "segment_count": len(result.segments),
-            "output_file": str(TRANSCRIPTIONS_DIR / f"{result.meeting_id}.json"),
-            "preview": [s.to_dict() for s in result.segments[:10]],
-            "next_step": f"Generate meeting minutes: audio_generate_pv('{result.meeting_id}')",
+            "meeting_id": meeting_id,
+            "status": "transcribing",
+            "message": (
+                "Transcription is running in the background and does not block. "
+                "Expect roughly 2x the recording's duration for a two-sided recording."
+            ),
+            "next_step": f"Poll audio_transcribe_status('{meeting_id}') until status is 'done'.",
         }
     )
 
@@ -375,10 +396,11 @@ def audio_stop_and_transcribe(
 @mcp.tool()
 def audio_transcribe_status(
     meeting_id: Annotated[
-        str, Field(description="Meeting ID returned by audio_stop_and_transcribe")
+        str,
+        Field(description="Meeting ID returned by audio_stop_and_transcribe or audio_transcribe"),
     ],
 ) -> dict:
-    """Check a background transcription started by audio_stop_and_transcribe.
+    """Check a background transcription started by audio_stop_and_transcribe or audio_transcribe.
 
     Returns status 'transcribing' (still working), 'done' (with preview and
     output file), or 'error'. Poll until 'done', then generate meeting minutes.

@@ -1,6 +1,7 @@
 """Tests for server module."""
 
 import sys
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -225,3 +226,37 @@ def test_transcribe_status_disk_fallback(tmp_path):
         (tmp_path / "2099-01-01_partial.json").write_text('{"segments": [', encoding="utf-8")
         status = audio_transcribe_status("2099-01-01_partial")
         assert status["status"] == "error"
+
+
+def test_transcribe_existing_file_is_nonblocking(tmp_path):
+    """audio_transcribe must not block: a long transcription would outlive the
+    MCP idle timeout, so it starts a background job and returns immediately."""
+    meeting_id = "2026-01-04_test-existing"
+    wav = tmp_path / f"{meeting_id}.wav"
+    wav.write_bytes(b"RIFF")
+    release = threading.Event()
+
+    def slow_transcribe(*args, **kwargs):
+        release.wait(timeout=5.0)
+        return _fake_transcription(meeting_id)
+
+    with patch("claude_meeting_mcp.server.transcribe_meeting", side_effect=slow_transcribe):
+        from claude_meeting_mcp.server import audio_transcribe
+
+        result = audio_transcribe(file_path=str(wav), local_speakers="Alice", remote_speakers="Bob")
+        # Returned while transcribe_meeting is still blocked.
+        assert result["status"] == "transcribing"
+        assert result["meeting_id"] == meeting_id
+
+        release.set()
+        status = _poll_until_settled(meeting_id)
+        assert status["status"] == "done"
+        assert status["segment_count"] == 1
+
+
+def test_transcribe_existing_file_missing_fails_fast(tmp_path):
+    """A bad path is reported by the call itself, not hidden behind a poll."""
+    from claude_meeting_mcp.server import audio_transcribe
+
+    result = audio_transcribe(file_path=str(tmp_path / "nope.wav"))
+    assert "error" in result
