@@ -14,6 +14,7 @@ from typing import Annotated
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
+from . import jobs
 from .capture import get_capturer
 from .config import get_config, update_config, validate_config
 from .pv_generator import generate_pv, save_pv
@@ -133,7 +134,14 @@ def _run_transcription_job(
 ) -> None:
     """Transcribe in a background thread and record the outcome in the job state."""
     try:
-        result = transcribe_meeting(file_path, remote, local, model)
+        # Wait for the GPU rather than fight for it: MLX monopolises Metal, so two
+        # overlapping transcriptions are strictly slower than the same two in turn.
+        # Blocking here costs nothing - the tool call already returned, and recording
+        # runs in a separate process that this never touches.
+        with jobs.gpu_slot():
+            jobs.mark_running(meeting_id)
+            _set_job(meeting_id, status="transcribing", started_at=time.time())
+            result = transcribe_meeting(file_path, remote, local, model)
         _set_job(
             meeting_id,
             status="done",
@@ -145,6 +153,84 @@ def _run_transcription_job(
     except Exception as e:  # noqa: BLE001 - surface any failure via job state, never crash the thread
         logger.exception("Background transcription failed for %s", meeting_id)
         _set_job(meeting_id, status="error", finished_at=time.time(), error=str(e))
+    finally:
+        jobs.release(meeting_id)
+
+
+def _start_transcription_job(
+    meeting_id: str,
+    file_path: str,
+    remote: str,
+    local: str,
+    model: str | None,
+    message: str,
+) -> dict:
+    """Claim a queue slot and start the background job, or explain why not.
+
+    Shared by both entry points so the duplicate-work guard cannot be bypassed by
+    using one rather than the other.
+    """
+    claim = jobs.enqueue(meeting_id, file_path)
+
+    if not claim.accepted:
+        if claim.reason == "queue_full":
+            return _enrich_result(
+                {
+                    "error": (
+                        f"Transcription queue is full ({claim.queue.queued} waiting, "
+                        f"max {jobs.MAX_QUEUED}). The recording is safe on disk - "
+                        "transcribe it once the backlog clears."
+                    ),
+                    "meeting_id": meeting_id,
+                    "queue": claim.queue.to_dict(),
+                }
+            )
+        # already_active: another job - possibly in another Claude session - is
+        # already on this exact file. Point at it instead of starting a rival.
+        return _enrich_result(
+            {
+                "meeting_id": meeting_id,
+                "status": jobs.state_of(meeting_id) or "transcribing",
+                "message": "Already being transcribed - not starting a second run.",
+                "next_step": (
+                    f"Poll audio_transcribe_status('{meeting_id}') until status is 'done'."
+                ),
+                "queue": claim.queue.to_dict(),
+            }
+        )
+
+    _prune_jobs()
+    waiting = claim.queue.active > 0 or claim.queue.queued > 1
+    _set_job(
+        meeting_id,
+        status="queued" if waiting else "transcribing",
+        started_at=time.time(),
+        file=file_path,
+    )
+    threading.Thread(
+        target=_run_transcription_job,
+        args=(meeting_id, file_path, remote, local, model),
+        daemon=True,
+    ).start()
+
+    result = {
+        "meeting_id": meeting_id,
+        "status": "queued" if waiting else "transcribing",
+        "message": message,
+        "next_step": f"Poll audio_transcribe_status('{meeting_id}') until status is 'done'.",
+        "queue": claim.queue.to_dict(),
+    }
+    if waiting:
+        result["message"] += (
+            f" {claim.queue.active + claim.queue.queued - 1} job(s) ahead of it; "
+            "transcriptions run one at a time so they do not slow each other down."
+        )
+    if claim.queue.inconsistent:
+        result["warning"] = (
+            "Job registry is inconsistent - slots are held that the queue cannot "
+            "account for. Restart the MCP server if counts look wrong."
+        )
+    return _enrich_result(result)
 
 
 # --- Recording & Transcription ---
@@ -316,28 +402,16 @@ def audio_transcribe(
     # being transcribed, and the two competed for GPU and memory. Backgrounding plus a
     # pollable job id is what prevents that. Same background job as
     # audio_stop_and_transcribe.
-    meeting_id = wav.stem
-    local = local_speakers or "Local"
-    remote = remote_speakers or "Remote"
-
-    _prune_jobs()
-    _set_job(meeting_id, status="transcribing", started_at=time.time(), file=file_path)
-    threading.Thread(
-        target=_run_transcription_job,
-        args=(meeting_id, file_path, remote, local, model),
-        daemon=True,
-    ).start()
-
-    return _enrich_result(
-        {
-            "meeting_id": meeting_id,
-            "status": "transcribing",
-            "message": (
-                "Transcription is running in the background and does not block. "
-                "Expect roughly half the recording's duration, longer on a loaded machine."
-            ),
-            "next_step": f"Poll audio_transcribe_status('{meeting_id}') until status is 'done'.",
-        }
+    return _start_transcription_job(
+        wav.stem,
+        file_path,
+        remote_speakers or "Remote",
+        local_speakers or "Local",
+        model,
+        message=(
+            "Transcription is running in the background and does not block. "
+            "Expect roughly half the recording's duration, longer on a loaded machine."
+        ),
     )
 
 
@@ -374,28 +448,17 @@ def audio_stop_and_transcribe(
         return stop_result
 
     file_path = stop_result["file"]
-    meeting_id = Path(file_path).stem
-    local = local_speakers or "Local"
-    remote = remote_speakers or "Remote"
 
-    _prune_jobs()
-    _set_job(meeting_id, status="transcribing", started_at=time.time(), file=file_path)
-    threading.Thread(
-        target=_run_transcription_job,
-        args=(meeting_id, file_path, remote, local, model),
-        daemon=True,
-    ).start()
-
-    return _enrich_result(
-        {
-            "meeting_id": meeting_id,
-            "status": "transcribing",
-            "message": (
-                "Recording stopped. Transcription is running in the background and does "
-                "not block - capture your notes now, then check the transcript."
-            ),
-            "next_step": f"Poll audio_transcribe_status('{meeting_id}') until status is 'done'.",
-        }
+    return _start_transcription_job(
+        Path(file_path).stem,
+        file_path,
+        remote_speakers or "Remote",
+        local_speakers or "Local",
+        model,
+        message=(
+            "Recording stopped. Transcription is running in the background and does "
+            "not block - capture your notes now, then check the transcript."
+        ),
     )
 
 
@@ -434,23 +497,48 @@ def audio_transcribe_status(
                 "status": "done",
                 "output_file": str(path),
                 "next_step": f"Generate meeting minutes: audio_generate_pv('{meeting_id}')",
+                "queue": jobs.snapshot().to_dict(),
             }
-        return {"error": f"No transcription job found for '{meeting_id}'"}
+        # No transcript and no local job, but another process may still own this
+        # work. Reporting "not found" here is what previously made a live run look
+        # dead and invited a duplicate.
+        foreign = jobs.state_of(meeting_id)
+        if foreign is not None:
+            return {
+                "meeting_id": meeting_id,
+                "status": "transcribing" if foreign == jobs.RUNNING else "queued",
+                "message": (
+                    "Owned by another session's server. Keep polling - it will write "
+                    "the transcript to disk when it finishes."
+                ),
+                "queue": jobs.snapshot().to_dict(),
+            }
+        return {
+            "error": f"No transcription job found for '{meeting_id}'",
+            "queue": jobs.snapshot().to_dict(),
+        }
 
+    queue = jobs.snapshot()
     status = job.get("status")
-    if status == "transcribing":
+    if status in ("transcribing", "queued"):
         elapsed = time.time() - job.get("started_at", time.time())
         return {
             "meeting_id": meeting_id,
-            "status": "transcribing",
+            "status": status,
             "elapsed_seconds": round(elapsed, 1),
-            "message": "Still transcribing - check again shortly.",
+            "message": (
+                "Waiting for the GPU - another transcription is ahead of it."
+                if status == "queued"
+                else "Still transcribing - check again shortly."
+            ),
+            "queue": queue.to_dict(),
         }
     if status == "error":
         return {
             "meeting_id": meeting_id,
             "status": "error",
             "error": job.get("error", "unknown error"),
+            "queue": queue.to_dict(),
         }
 
     return {
@@ -461,6 +549,7 @@ def audio_transcribe_status(
         "output_file": str(TRANSCRIPTIONS_DIR / f"{meeting_id}.json"),
         "preview": job.get("preview", []),
         "next_step": f"Generate meeting minutes: audio_generate_pv('{meeting_id}')",
+        "queue": queue.to_dict(),
     }
 
 

@@ -148,12 +148,12 @@ def _fake_transcription(meeting_id):
 
 
 def _poll_until_settled(meeting_id, timeout=5.0):
-    """Poll audio_transcribe_status until the background job leaves 'transcribing'."""
+    """Poll audio_transcribe_status until the background job reaches a final state."""
     from claude_meeting_mcp.server import audio_transcribe_status
 
     deadline = time.monotonic() + timeout
     status = audio_transcribe_status(meeting_id)
-    while status.get("status") == "transcribing" and time.monotonic() < deadline:
+    while status.get("status") in ("transcribing", "queued") and time.monotonic() < deadline:
         time.sleep(0.01)
         status = audio_transcribe_status(meeting_id)
     return status
@@ -260,3 +260,126 @@ def test_transcribe_existing_file_missing_fails_fast(tmp_path):
 
     result = audio_transcribe(file_path=str(tmp_path / "nope.wav"))
     assert "error" in result
+
+
+# --- Queue behaviour: never transcribe the same file twice, never block recording ---
+
+
+def test_same_file_is_not_transcribed_twice(tmp_path):
+    """The bug this queue exists for: a second call must join, not duplicate."""
+    meeting_id = "2026-01-05_test-dedupe"
+    wav = tmp_path / f"{meeting_id}.wav"
+    wav.write_bytes(b"RIFF")
+    release = threading.Event()
+
+    def slow_transcribe(*args, **kwargs):
+        release.wait(timeout=5.0)
+        return _fake_transcription(meeting_id)
+
+    with patch(
+        "claude_meeting_mcp.server.transcribe_meeting", side_effect=slow_transcribe
+    ) as mock_tm:
+        from claude_meeting_mcp.server import audio_transcribe
+
+        first = audio_transcribe(file_path=str(wav))
+        second = audio_transcribe(file_path=str(wav))
+
+        assert first["status"] == "transcribing"
+        assert "not starting a second run" in second["message"]
+        assert second["queue"]["total"] == 1, "the duplicate must not take a slot"
+
+        release.set()
+        assert _poll_until_settled(meeting_id)["status"] == "done"
+        assert mock_tm.call_count == 1, "transcribed twice - the whole point of the queue"
+
+
+def test_queue_refuses_a_seventh_job(tmp_path):
+    """Five waiting plus one running is the ceiling; the next is refused, not dropped."""
+    release = threading.Event()
+
+    def slow_transcribe(*args, **kwargs):
+        release.wait(timeout=5.0)
+        return _fake_transcription("x")
+
+    with patch("claude_meeting_mcp.server.transcribe_meeting", side_effect=slow_transcribe):
+        from claude_meeting_mcp import jobs
+        from claude_meeting_mcp.server import audio_transcribe
+
+        accepted = []
+        for i in range(6):
+            wav = tmp_path / f"2026-01-05_job{i}.wav"
+            wav.write_bytes(b"RIFF")
+            accepted.append(audio_transcribe(file_path=str(wav)))
+            if i == 0:
+                # Wait for the first job to take the GPU, so the remaining five are
+                # unambiguously the backlog rather than racing it.
+                deadline = time.monotonic() + 5.0
+                while jobs.snapshot().active == 0 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert jobs.snapshot().active == 1
+
+        overflow_wav = tmp_path / "2026-01-05_overflow.wav"
+        overflow_wav.write_bytes(b"RIFF")
+        overflow = audio_transcribe(file_path=str(overflow_wav))
+
+        assert all("error" not in r for r in accepted)
+        assert "queue is full" in overflow["error"]
+        assert overflow["queue"]["queued"] == 5
+        release.set()
+
+
+def test_every_response_reports_the_queue(tmp_path):
+    """Davide's rule: the queue length is visible on every call."""
+    meeting_id = "2026-01-05_test-visible"
+    wav = tmp_path / f"{meeting_id}.wav"
+    wav.write_bytes(b"RIFF")
+
+    with patch(
+        "claude_meeting_mcp.server.transcribe_meeting",
+        return_value=_fake_transcription(meeting_id),
+    ):
+        from claude_meeting_mcp.server import audio_transcribe, audio_transcribe_status
+
+        assert "queue" in audio_transcribe(file_path=str(wav))
+        _poll_until_settled(meeting_id)
+        assert "queue" in audio_transcribe_status(meeting_id)
+        assert "queue" in audio_transcribe_status("2026-01-05_no-such-meeting")
+
+
+def test_recording_can_start_while_a_transcription_runs(tmp_path):
+    """Recording must never be gated on the transcription backlog."""
+    meeting_id = "2026-01-05_test-concurrent"
+    wav = tmp_path / f"{meeting_id}.wav"
+    wav.write_bytes(b"RIFF")
+    release = threading.Event()
+
+    def slow_transcribe(*args, **kwargs):
+        release.wait(timeout=5.0)
+        return _fake_transcription(meeting_id)
+
+    with (
+        patch("claude_meeting_mcp.server.transcribe_meeting", side_effect=slow_transcribe),
+        patch(
+            "claude_meeting_mcp.server.start_recording",
+            return_value={"status": "recording", "file": "/tmp/new.wav"},
+        ),
+    ):
+        from claude_meeting_mcp.server import audio_record_start, audio_transcribe
+
+        assert audio_transcribe(file_path=str(wav))["status"] == "transcribing"
+
+        started = audio_record_start(ctx=MagicMock())
+        assert started["status"] == "recording", "transcription blocked a new recording"
+        release.set()
+
+
+def test_status_sees_a_job_owned_by_another_process(tmp_path):
+    """A live claim from another server must not read as 'no job found'."""
+    from claude_meeting_mcp import jobs
+    from claude_meeting_mcp.server import audio_transcribe_status
+
+    jobs.enqueue("2026-01-05_foreign", "/tmp/foreign.wav")
+    status = audio_transcribe_status("2026-01-05_foreign")
+
+    assert status["status"] == "queued"
+    assert "another session" in status["message"]
