@@ -305,10 +305,16 @@ def audio_transcribe(
     if not wav.is_file():
         return {"error": f"File not found: {file_path}"}
 
-    # Never transcribe inline. On MLX the two channels run sequentially at
-    # roughly 1x real time each, so a two-sided recording costs ~2x its duration
-    # - past the MCP client's idle timeout for anything but a very short file,
-    # which kills the call and loses the work. Same background job as
+    # Never transcribe inline. Measured over 13 runs, transcription takes 0.25-0.55x
+    # the recording's duration on a healthy machine, but 1-2.9x on a loaded one - so a
+    # long file can outrun the MCP client's idle timeout (~37 min).
+    #
+    # When that happened the work was not lost: the server thread kept going and wrote
+    # the transcript, in one observed case three days after the caller had given up.
+    # What was lost was the *answer* - and, worse, the caller then had no way to tell a
+    # dead run from a live one, so a "recovery" run got launched against a file already
+    # being transcribed, and the two competed for GPU and memory. Backgrounding plus a
+    # pollable job id is what prevents that. Same background job as
     # audio_stop_and_transcribe.
     meeting_id = wav.stem
     local = local_speakers or "Local"
@@ -328,7 +334,7 @@ def audio_transcribe(
             "status": "transcribing",
             "message": (
                 "Transcription is running in the background and does not block. "
-                "Expect roughly 2x the recording's duration for a two-sided recording."
+                "Expect roughly half the recording's duration, longer on a loaded machine."
             ),
             "next_step": f"Poll audio_transcribe_status('{meeting_id}') until status is 'done'.",
         }
