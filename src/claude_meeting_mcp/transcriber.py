@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from . import _mlx
 from .config import get_config, get_faster_model_id, get_mlx_model_id
 from .schemas import Segment, Transcription
 from .storage import TRANSCRIPTIONS_DIR, ensure_dirs
@@ -73,22 +74,29 @@ def _transcribe_mlx(
     """Transcribe audio with MLX-Whisper (macOS Apple Silicon)."""
     import mlx_whisper
 
+    _mlx.cap_cache()
+
     config = get_config()
     model_id = get_mlx_model_id(model or config.transcription.model)
     language = _resolve_language(config.transcription.language)
 
     audio = audio.astype(np.float32, copy=False)
-    result = mlx_whisper.transcribe(
-        audio,
-        path_or_hf_repo=model_id,
-        language=language,
-        initial_prompt=prompt,
-        word_timestamps=True,
-        condition_on_previous_text=False,
-        hallucination_silence_threshold=1.0,
-        compression_ratio_threshold=2.4,
-        no_speech_threshold=0.6,
-    )
+    try:
+        result = mlx_whisper.transcribe(
+            audio,
+            path_or_hf_repo=model_id,
+            language=language,
+            initial_prompt=prompt,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+            hallucination_silence_threshold=1.0,
+            compression_ratio_threshold=2.4,
+            no_speech_threshold=0.6,
+        )
+    finally:
+        # This server outlives every transcription; drain the buffer cache here
+        # or it accumulates for the life of the Claude session. See _mlx.
+        _mlx.clear_cache()
     return result.get("segments", [])
 
 
@@ -204,20 +212,32 @@ WHISPER_SAMPLE_RATE = 16000
 
 
 def _resample_to_16k(audio: np.ndarray, samplerate: int) -> np.ndarray:
-    """Resample audio to 16kHz (what Whisper expects internally)."""
+    """Resample audio to 16kHz (what Whisper expects internally).
+
+    Polyphase (FIR), not scipy.signal.resample (FFT), for two reasons. pocketfft
+    caches an FFT plan per distinct transform length and never evicts it; since
+    every recording has a unique sample count that cache never hits and only
+    grows - a day-old server held 12 GB across 89 dead plans. FFT resampling also
+    assumes a periodic signal, so it wraps the end of a recording into its start.
+    """
     if samplerate == WHISPER_SAMPLE_RATE:
         return audio
-    from scipy.signal import resample
+    from math import gcd
 
-    new_length = int(len(audio) * WHISPER_SAMPLE_RATE / samplerate)
+    from scipy.signal import resample_poly
+
+    divisor = gcd(WHISPER_SAMPLE_RATE, samplerate)
+    up, down = WHISPER_SAMPLE_RATE // divisor, samplerate // divisor
     logger.info(
-        "Resampling %d Hz → %d Hz (%d → %d samples)",
+        "Resampling %d Hz → %d Hz (%d → %d samples, %d/%d)",
         samplerate,
         WHISPER_SAMPLE_RATE,
         len(audio),
-        new_length,
+        int(len(audio) * WHISPER_SAMPLE_RATE / samplerate),
+        up,
+        down,
     )
-    return resample(audio, new_length).astype(np.float32)
+    return resample_poly(audio, up, down).astype(np.float32)
 
 
 # A channel whose RMS sits below this (~-60 dBFS) carries no usable speech, so we
