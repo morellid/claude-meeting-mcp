@@ -18,7 +18,14 @@ from . import jobs
 from .capture import get_capturer
 from .config import get_config, update_config, validate_config
 from .pv_generator import generate_pv, save_pv
-from .recorder import get_live_status, is_recording, start_recording, stop_recording
+from .recorder import (
+    get_live_status,
+    is_recording,
+    recording_elapsed_seconds,
+    set_auto_stop_handler,
+    start_recording,
+    stop_recording,
+)
 from .schemas import Transcription
 from .storage import (
     PV_DIR,
@@ -233,6 +240,46 @@ def _start_transcription_job(
     return _enrich_result(result)
 
 
+def _transcribe_auto_stopped(file_path: str) -> None:
+    """Transcribe a recording the safety cap stopped, as if the user had stopped it.
+
+    Runs on the timer thread once the capture is already closed. Without this the
+    cap left a forgotten meeting as a bare WAV, and the next stop reported "No
+    recording in progress" - so the audio was silently on its own.
+    """
+    meeting_id = Path(file_path).stem
+    logger.warning("Safety cap stopped %s - queueing its transcription", file_path)
+    result = _start_transcription_job(
+        meeting_id,
+        file_path,
+        "Remote",
+        "Local",
+        None,
+        message=(
+            "This recording hit the safety cap (recording.max_seconds) and was stopped "
+            "automatically, so the audio ends there. Transcription is running in the "
+            "background."
+        ),
+    )
+
+    # Nobody is waiting on this call's return value, so a refusal (a full queue,
+    # say) would otherwise vanish and leave the WAV untranscribed and unexplained -
+    # the exact failure the cap is meant to end. Record it where a later
+    # audio_transcribe_status() will find it.
+    if "error" in result:
+        logger.error("Auto-stopped %s could not be queued: %s", meeting_id, result["error"])
+        _set_job(
+            meeting_id,
+            status="error",
+            finished_at=time.time(),
+            file=file_path,
+            error=result["error"],
+        )
+
+
+set_auto_stop_handler(_transcribe_auto_stopped)
+
+
 # --- Recording & Transcription ---
 
 
@@ -284,6 +331,10 @@ def audio_status() -> dict:
         "transcription_language": config.transcription.language,
         "diarization_enabled": config.diarization.enabled,
         "currently_recording": is_recording(),
+        "recording_elapsed_seconds": (
+            round(elapsed) if (elapsed := recording_elapsed_seconds()) is not None else None
+        ),
+        "recording_max_seconds": config.recording.max_seconds,
         "disk_free_gb": disk_free_gb,
         "last_recording": last_recording,
     }
@@ -317,6 +368,11 @@ def audio_record_start(
     result = start_recording(live_translate=live_translate, mcp_context=ctx, event_loop=loop)
     if "error" not in result:
         result["next_step"] = "When done, call audio_stop_and_transcribe()"
+        if "max_seconds" in result:
+            result["safety_cap"] = (
+                f"Recording stops and transcribes itself automatically after "
+                f"{result['max_seconds'] // 60} minutes if nobody stops it."
+            )
         if live_translate:
             result["next_step"] += " | Check live translation: audio_live_status()"
     return _enrich_result(result)

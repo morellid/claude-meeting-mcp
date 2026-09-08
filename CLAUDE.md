@@ -70,6 +70,8 @@ api_key_env = "TRANSCRIPTION_API_KEY"
 
 [recording]
 sample_rate = 48000
+max_seconds = 7200          # garde-fou : un enregistrement que personne n'arrete
+                            # est stoppe ET transcrit automatiquement apres 2h
 
 [diarization]
 enabled = false             # activer pour reunions multi-speakers

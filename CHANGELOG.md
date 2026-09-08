@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Recording safety cap**: now stops **and transcribes**, instead of stopping and
+  leaving the WAV behind with no transcript and no signal that anything had been
+  captured. Default lowered from 4h to 2h and made configurable through
+  `recording.max_seconds`.
+- `audio_status` reports `recording_elapsed_seconds` and `recording_max_seconds`,
+  so a caller can say how long it has been recording and how long is left.
+
 ## [0.3.0] - 2026-04-15
 
 ### Added

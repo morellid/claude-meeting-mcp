@@ -266,6 +266,8 @@ api_key_env = "TRANSCRIPTION_API_KEY"   # name of the env var holding the API ke
 
 [recording]
 sample_rate = 48000
+max_seconds = 7200          # safety cap: a recording nobody stops is stopped
+                            # AND transcribed automatically after 2 hours
 
 [diarization]
 enabled = false             # enable for multi-speaker meetings

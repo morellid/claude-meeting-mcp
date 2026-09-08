@@ -57,6 +57,10 @@ class TranscriptionConfig:
 @dataclass
 class RecordingConfig:
     sample_rate: int = 48000
+    # Hard stop for a recording nobody remembered to end. Two hours is past the
+    # length of almost any meeting but still cheap to throw away (~1.4 GB), and
+    # the cap now transcribes what it stopped instead of orphaning the WAV.
+    max_seconds: int = 2 * 3600
 
 
 @dataclass
@@ -121,6 +125,8 @@ def _apply_toml_to_config(config: Config, data: dict[str, Any]) -> None:
         rec = data["recording"]
         if "sample_rate" in rec:
             config.recording.sample_rate = int(rec["sample_rate"])
+        if "max_seconds" in rec:
+            config.recording.max_seconds = int(rec["max_seconds"])
 
     if "diarization" in data:
         d = data["diarization"]
@@ -166,6 +172,11 @@ def validate_config(config: Config) -> list[str]:
             f"Unusual sample rate {config.recording.sample_rate}. "
             "Expected: 16000, 22050, 44100, or 48000"
         )
+    if config.recording.max_seconds <= 0:
+        errors.append(
+            f"recording.max_seconds must be positive, got {config.recording.max_seconds}. "
+            "It is the safety cap that stops a forgotten recording."
+        )
     if config.diarization.backend not in VALID_DIARIZATION_BACKENDS:
         errors.append(
             f"Invalid diarization backend '{config.diarization.backend}'. "
@@ -205,6 +216,7 @@ def save_config(config: Config) -> Path:
         "",
         "[recording]",
         f"sample_rate = {config.recording.sample_rate}",
+        f"max_seconds = {config.recording.max_seconds}",
         "",
         "[diarization]",
         f"enabled = {'true' if config.diarization.enabled else 'false'}",
@@ -270,6 +282,8 @@ def update_config(key: str, value: str) -> Config:
             setattr(config.transcription, field_name, value)
         elif section == "recording" and field_name == "sample_rate":
             config.recording.sample_rate = int(value)
+        elif section == "recording" and field_name == "max_seconds":
+            config.recording.max_seconds = int(value)
         elif section == "diarization" and field_name == "backend":
             config.diarization.backend = value
         elif section == "diarization" and field_name == "enabled":

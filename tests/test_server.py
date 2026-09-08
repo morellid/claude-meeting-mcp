@@ -383,3 +383,24 @@ def test_status_sees_a_job_owned_by_another_process(tmp_path):
 
     assert status["status"] == "queued"
     assert "another session" in status["message"]
+
+
+def test_a_refused_auto_stop_transcription_is_not_lost(tmp_path):
+    """Nobody awaits the cap's job, so a refusal has to be recorded to be findable."""
+    meeting_id = "2026-01-05_capped"
+    wav = tmp_path / f"{meeting_id}.wav"
+    wav.write_bytes(b"RIFF")
+
+    with patch(
+        "claude_meeting_mcp.server._start_transcription_job",
+        return_value={"error": "Transcription queue is full (5 waiting, max 5)."},
+    ):
+        from claude_meeting_mcp.server import _transcribe_auto_stopped
+
+        _transcribe_auto_stopped(str(wav))
+
+    from claude_meeting_mcp.server import audio_transcribe_status
+
+    status = audio_transcribe_status(meeting_id)
+    assert status["status"] == "error"
+    assert "queue is full" in status["error"]

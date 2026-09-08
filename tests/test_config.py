@@ -58,6 +58,28 @@ def test_apply_toml_recording():
     assert config.recording.sample_rate == 16000
 
 
+def test_apply_toml_recording_max_seconds():
+    config = Config()
+    assert config.recording.max_seconds == 7200  # 2h default safety cap
+    _apply_toml_to_config(config, {"recording": {"max_seconds": 5400}})
+    assert config.recording.max_seconds == 5400
+
+
+def test_validate_non_positive_max_seconds():
+    config = Config()
+    config.recording.max_seconds = 0
+    errors = validate_config(config)
+    assert any("max_seconds" in e for e in errors)
+
+
+def test_max_seconds_round_trips_through_toml(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_MEETING_CONFIG_DIR", str(tmp_path))
+    config = Config()
+    config.recording.max_seconds = 3600
+    save_config(config)
+    assert load_config().recording.max_seconds == 3600
+
+
 def test_apply_toml_diarization():
     config = Config()
     data = {"diarization": {"enabled": True, "backend": "whisperx"}}
