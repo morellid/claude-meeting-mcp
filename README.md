@@ -288,6 +288,21 @@ auto_generate = true        # suggest PV generation after transcription
 | `large-v3-turbo` | 809M | Excellent | Fast | **Recommended** |
 | `large-v3` | 1.5B | Best | Slow | Critical meetings |
 
+### Using Mistral Voxtral (speaker diarization, EU)
+
+`mode = "mistral"` sends one mono mix of the recording to Mistral's Voxtral Mini Transcribe V2 in a single request (up to 3 hours). Voxtral separates speakers by voice, so the transcript has `Speaker 1`, `Speaker 2`, ... instead of `Remote`/`Local`, and that stays correct even when the mic picks up the speakers. Participant names are sent as `context_bias` so they are spelled correctly.
+
+```toml
+[transcription]
+mode = "mistral"
+```
+
+The key is read from `MISTRAL_API_KEY`, then from the macOS Keychain. MCP servers started by the Claude app do not see exports in `.zshrc`, so on macOS store it in the Keychain:
+
+```bash
+security add-generic-password -a "$USER" -s MISTRAL_API_KEY -w
+```
+
 ### Using a remote transcription API
 
 Instead of running Whisper locally, you can use any API that implements the OpenAI `/v1/audio/transcriptions` endpoint:

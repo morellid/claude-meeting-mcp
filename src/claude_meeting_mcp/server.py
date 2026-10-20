@@ -800,7 +800,11 @@ def audio_configure(
                             "key": "transcription.mode",
                             "current": config.transcription.mode,
                             "description": "Where transcription runs",
-                            "options": {"local": "on your machine", "remote": "via API"},
+                            "options": {
+                                "local": "on your machine",
+                                "remote": "via API",
+                                "mistral": "Mistral Voxtral, EU, with speaker diarization",
+                            },
                         },
                         {
                             "key": "transcription.remote.url",

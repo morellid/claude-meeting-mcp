@@ -32,7 +32,7 @@ FASTER_MODEL_MAP: dict[str, str] = {
 }
 
 VALID_MODELS = set(MLX_MODEL_MAP.keys())
-VALID_MODES = {"local", "remote"}
+VALID_MODES = {"local", "remote", "mistral"}
 VALID_DIARIZATION_BACKENDS = {"none", "whisperx", "pyannote"}
 
 
@@ -50,7 +50,7 @@ class TranscriptionConfig:
 
     model: str = "large-v3-turbo"
     language: str = "auto"  # "auto" = detect per channel; or a code like "it"/"en"
-    mode: str = "local"  # "local" (Whisper on device) or "remote" (API)
+    mode: str = "local"  # "local" (Whisper on device), "remote" (API) or "mistral" (Voxtral)
     remote: TranscriptionRemoteConfig = field(default_factory=TranscriptionRemoteConfig)
 
 

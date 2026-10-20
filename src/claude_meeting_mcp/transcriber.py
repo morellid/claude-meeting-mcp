@@ -2,11 +2,14 @@
 
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import httpx
 import numpy as np
 import soundfile as sf
 
@@ -25,13 +28,13 @@ _faster_model_name: str | None = None
 def _get_backend(mode_override: str | None = None) -> str:
     """Detect best available transcription backend.
 
-    Returns: 'remote', 'mlx', or 'faster'
+    Returns: 'mistral', 'remote', 'mlx', or 'faster'
     """
     config = get_config()
     mode = mode_override or config.transcription.mode
 
-    if mode == "remote":
-        return "remote"
+    if mode in ("remote", "mistral"):
+        return mode
 
     # Local mode: prefer MLX on macOS Apple Silicon
     if sys.platform == "darwin":
@@ -136,8 +139,6 @@ def _transcribe_remote_channel(wav_path: str, channel: str = "left") -> list[dic
         wav_path: Path to a mono WAV file (single channel)
         channel: 'left' or 'right' for logging
     """
-    import httpx
-
     config = get_config()
     url = config.transcription.remote.url
     api_key = os.environ.get(config.transcription.remote.api_key_env, "")
@@ -176,6 +177,131 @@ def _transcribe_remote_channel(wav_path: str, channel: str = "left") -> list[dic
         {"start": s["start"], "end": s["end"], "text": s["text"]}
         for s in result.get("segments", [])
     ]
+
+
+MISTRAL_URL = "https://api.mistral.ai/v1/audio/transcriptions"
+MISTRAL_MODEL = "voxtral-mini-latest"
+MISTRAL_MAX_CONTEXT_BIAS = 100  # API limit on biasing terms
+
+
+def _mistral_api_key() -> str:
+    """MISTRAL_API_KEY from the environment, else from the macOS Keychain.
+
+    The Claude app spawns MCP servers without a login shell, so an export in
+    .zshrc never reaches this process; the Keychain does.
+    """
+    key = os.environ.get("MISTRAL_API_KEY", "").strip()
+    if key:
+        return key
+    if sys.platform == "darwin":
+        found = subprocess.run(
+            ["security", "find-generic-password", "-s", "MISTRAL_API_KEY", "-w"],
+            capture_output=True,
+            text=True,
+        )
+        if found.returncode == 0 and found.stdout.strip():
+            return found.stdout.strip()
+    raise RuntimeError(
+        "MISTRAL_API_KEY not found in the environment or the Keychain. Store it with: "
+        'security add-generic-password -a "$USER" -s MISTRAL_API_KEY -w'
+    )
+
+
+def _mix_to_mono(
+    left: np.ndarray, right: np.ndarray, left_silent: bool, right_silent: bool
+) -> np.ndarray:
+    """Mix the system and mic channels into one track for a diarizing provider.
+
+    A silent channel is dropped rather than averaged in, which would only halve
+    the level of the live one. Mixes into `left` in place: a two-hour channel is
+    1.4 GB of float32, and the caller no longer needs the separate channels.
+    """
+    if left_silent:
+        return right
+    if right_silent:
+        return left
+    np.add(left, right, out=left)
+    left *= 0.5
+    return left
+
+
+def _encode_for_upload(audio: np.ndarray, samplerate: int) -> str:
+    """Write mono audio as 16 kHz Ogg/Opus to a temp file and return its path.
+
+    A raw 48 kHz WAV is ~5.8 MB per minute; Opus at 16 kHz is a few hundred KB,
+    which keeps a two-hour upload in seconds rather than minutes.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    tmp.close()
+    sf.write(
+        tmp.name,
+        _resample_to_16k(audio, samplerate),
+        WHISPER_SAMPLE_RATE,
+        format="OGG",
+        subtype="OPUS",
+    )
+    return tmp.name
+
+
+def _mistral_segments(result: dict) -> list[dict]:
+    """Turn Voxtral's diarized segments into pipeline dicts with a speaker label.
+
+    Voxtral ids ("speaker_3") carry no identity, so they are renumbered in order of
+    first appearance: "Speaker 1" is whoever talks first. Mapping labels to names
+    is left to the reader, who has the calendar and the context.
+    """
+    labels: dict[str, str] = {}
+    segments: list[dict] = []
+    for seg in result.get("segments", []):
+        if not seg.get("text", "").strip():
+            continue
+        speaker_id = seg.get("speaker_id") or "unknown"
+        if speaker_id not in labels:
+            labels[speaker_id] = f"Speaker {len(labels) + 1}"
+        segments.append(
+            {
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"],
+                "speaker": labels[speaker_id],
+            }
+        )
+    return segments
+
+
+def _transcribe_mistral(audio: np.ndarray, samplerate: int, names: list[str]) -> list[dict]:
+    """Transcribe and diarize one mono track with Mistral Voxtral in a single request.
+
+    Voxtral takes up to 3 hours per request, past the recording safety cap, so the
+    file is never chunked. Known participant names go in as context_bias so they
+    are spelled right.
+    """
+    path = _encode_for_upload(audio, samplerate)
+    data: dict[str, str | list[str]] = {
+        "model": MISTRAL_MODEL,
+        "diarize": "true",
+        "timestamp_granularities": "segment",
+    }
+    if names:
+        data["context_bias"] = names[:MISTRAL_MAX_CONTEXT_BIAS]
+    language = _resolve_language(get_config().transcription.language)
+    if language:
+        data["language"] = language
+
+    try:
+        with open(path, "rb") as f:
+            response = httpx.post(
+                MISTRAL_URL,
+                headers={"Authorization": f"Bearer {_mistral_api_key()}"},
+                files={"file": (Path(path).name, f, "audio/ogg")},
+                data=data,
+                timeout=httpx.Timeout(900.0, connect=30.0),
+            )
+    finally:
+        os.unlink(path)
+
+    response.raise_for_status()
+    return _mistral_segments(response.json())
 
 
 def _can_parallelize() -> bool:
@@ -262,8 +388,15 @@ def _build_name_prompt(*speaker_lists: str | None) -> str | None:
     """Build a Whisper initial_prompt that biases toward known participant names.
 
     Names are passed verbatim as a spelling hint so Whisper transcribes them
-    correctly (e.g. "Davide", "Nadeem"). Placeholder labels ("Remote"/"Local")
-    and blanks are ignored. Returns None when no real names are available.
+    correctly (e.g. "Davide", "Nadeem"). Returns None when no real names are available.
+    """
+    return ", ".join(_known_names(*speaker_lists)) or None
+
+
+def _known_names(*speaker_lists: str | None) -> list[str]:
+    """Real participant names from comma-separated lists, deduped case-insensitively.
+
+    Placeholder labels ("Remote"/"Local") and blanks are ignored.
     """
     names: list[str] = []
     seen: set[str] = set()
@@ -278,9 +411,7 @@ def _build_name_prompt(*speaker_lists: str | None) -> str | None:
             if key not in seen:
                 seen.add(key)
                 names.append(name)
-    if not names:
-        return None
-    return ", ".join(names)
+    return names
 
 
 def transcribe_channel(
@@ -421,7 +552,17 @@ def transcribe_meeting(
     if name_prompt:
         logger.info("Biasing transcription toward names: %s", name_prompt)
 
-    if backend == "remote":
+    if backend == "mistral":
+        # Voxtral separates voices itself, so it gets one mono mix in one request.
+        # Mic bleed makes the system/mic split mislabel speakers anyway; voice
+        # diarization does not care which channel a voice leaked into.
+        left_segments = _transcribe_mistral(
+            _mix_to_mono(left_audio, right_audio, left_silent, right_silent),
+            samplerate,
+            _known_names(remote_speakers, local_speakers),
+        )
+        right_segments = []
+    elif backend == "remote":
         left_segments, right_segments = [], []
         left_tmp = right_tmp = None
         try:
@@ -462,8 +603,8 @@ def transcribe_meeting(
             [] if right_silent else transcribe_channel(right_audio, samplerate, model, name_prompt)
         )
 
-    # Apply diarization if enabled
-    if config.diarization.enabled:
+    # Apply diarization if enabled (Voxtral has already diarized)
+    if config.diarization.enabled and backend != "mistral":
         left_segments = _diarize_and_assign(
             left_audio, samplerate, left_segments, remote_names, "remote"
         )

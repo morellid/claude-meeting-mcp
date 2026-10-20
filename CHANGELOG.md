@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Mistral Voxtral backend** (`transcription.mode = "mistral"`): one diarized request on a
+  16 kHz Opus mono mix, participant names as `context_bias`, key from env or the macOS Keychain.
+
 ### Changed
 - **Recording safety cap**: now stops **and transcribes**, instead of stopping and
   leaving the WAV behind with no transcript and no signal that anything had been
