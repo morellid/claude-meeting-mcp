@@ -182,6 +182,11 @@ def _transcribe_remote_channel(wav_path: str, channel: str = "left") -> list[dic
 MISTRAL_URL = "https://api.mistral.ai/v1/audio/transcriptions"
 MISTRAL_MODEL = "voxtral-mini-latest"
 MISTRAL_MAX_CONTEXT_BIAS = 100  # API limit on biasing terms
+# The plan allows 3600 audio-seconds per minute, so a request over an hour is
+# always a 429. 25-minute chunks keep two back-to-back requests under the budget.
+MISTRAL_MAX_CHUNK_SECONDS = 1500
+MISTRAL_RATE_LIMIT_RETRIES = 5
+MISTRAL_RATE_LIMIT_WAIT_SECONDS = 60
 
 
 def _mistral_api_key() -> str:
@@ -243,40 +248,76 @@ def _encode_for_upload(audio: np.ndarray, samplerate: int) -> str:
     return tmp.name
 
 
-def _mistral_segments(result: dict) -> list[dict]:
+def _mistral_segments(
+    result: dict,
+    offset: float = 0.0,
+    labels: dict[tuple[int, str], str] | None = None,
+    chunk: int = 0,
+) -> list[dict]:
     """Turn Voxtral's diarized segments into pipeline dicts with a speaker label.
 
     Voxtral ids ("speaker_3") carry no identity, so they are renumbered in order of
-    first appearance: "Speaker 1" is whoever talks first. Mapping labels to names
-    is left to the reader, who has the calendar and the context.
+    first appearance: "Speaker 1" is whoever talks first. Ids restart in every
+    chunk, so `labels` is keyed by chunk too: the same voice in a later chunk gets
+    a new number rather than being merged with whoever had its id before. Mapping
+    labels to names is left to the reader, who has the calendar and the context.
     """
-    labels: dict[str, str] = {}
+    labels = {} if labels is None else labels
     segments: list[dict] = []
     for seg in result.get("segments", []):
         if not seg.get("text", "").strip():
             continue
-        speaker_id = seg.get("speaker_id") or "unknown"
-        if speaker_id not in labels:
-            labels[speaker_id] = f"Speaker {len(labels) + 1}"
+        key = (chunk, seg.get("speaker_id") or "unknown")
+        if key not in labels:
+            labels[key] = f"Speaker {len(labels) + 1}"
         segments.append(
             {
-                "start": seg["start"],
-                "end": seg["end"],
+                "start": seg["start"] + offset,
+                "end": seg["end"] + offset,
                 "text": seg["text"],
-                "speaker": labels[speaker_id],
+                "speaker": labels[key],
             }
         )
     return segments
 
 
-def _transcribe_mistral(audio: np.ndarray, samplerate: int, names: list[str]) -> list[dict]:
-    """Transcribe and diarize one mono track with Mistral Voxtral in a single request.
-
-    Voxtral takes up to 3 hours per request, past the recording safety cap, so the
-    file is never chunked. Known participant names go in as context_bias so they
-    are spelled right, one word per term: the API rejects a term with whitespace.
-    """
+def _post_mistral(audio: np.ndarray, samplerate: int, data: dict) -> dict:
+    """One Voxtral request, waiting out the per-minute audio budget on a 429."""
     path = _encode_for_upload(audio, samplerate)
+    try:
+        for attempt in range(MISTRAL_RATE_LIMIT_RETRIES + 1):
+            with open(path, "rb") as f:
+                response = httpx.post(
+                    MISTRAL_URL,
+                    headers={"Authorization": f"Bearer {_mistral_api_key()}"},
+                    files={"file": (Path(path).name, f, "audio/ogg")},
+                    data=data,
+                    timeout=httpx.Timeout(900.0, connect=30.0),
+                )
+            if response.status_code != 429 or attempt == MISTRAL_RATE_LIMIT_RETRIES:
+                break
+            logger.info("Mistral rate limit hit, retrying in %ss", MISTRAL_RATE_LIMIT_WAIT_SECONDS)
+            time.sleep(MISTRAL_RATE_LIMIT_WAIT_SECONDS)
+    finally:
+        os.unlink(path)
+
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        # The status line alone hides the body, which is where the API says what is wrong.
+        raise httpx.HTTPStatusError(
+            f"{e}\n{response.text}", request=e.request, response=e.response
+        ) from e
+    return response.json()
+
+
+def _transcribe_mistral(audio: np.ndarray, samplerate: int, names: list[str]) -> list[dict]:
+    """Transcribe and diarize one mono track with Mistral Voxtral.
+
+    Audio longer than MISTRAL_MAX_CHUNK_SECONDS goes in equal chunks, sent one
+    after the other. Known participant names go in as context_bias so they are
+    spelled right, one word per term: the API rejects a term with whitespace.
+    """
     data: dict[str, str | list[str]] = {
         "model": MISTRAL_MODEL,
         "diarize": "true",
@@ -292,26 +333,14 @@ def _transcribe_mistral(audio: np.ndarray, samplerate: int, names: list[str]) ->
     if language:
         data["language"] = language
 
-    try:
-        with open(path, "rb") as f:
-            response = httpx.post(
-                MISTRAL_URL,
-                headers={"Authorization": f"Bearer {_mistral_api_key()}"},
-                files={"file": (Path(path).name, f, "audio/ogg")},
-                data=data,
-                timeout=httpx.Timeout(900.0, connect=30.0),
-            )
-    finally:
-        os.unlink(path)
-
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        # The status line alone hides the body, which is where the API says what is wrong.
-        raise httpx.HTTPStatusError(
-            f"{e}\n{response.text}", request=e.request, response=e.response
-        ) from e
-    return _mistral_segments(response.json())
+    n_chunks = max(1, -(-len(audio) // (MISTRAL_MAX_CHUNK_SECONDS * samplerate)))
+    labels: dict[tuple[int, str], str] = {}
+    segments: list[dict] = []
+    offset = 0.0
+    for chunk, part in enumerate(np.array_split(audio, n_chunks)):
+        segments += _mistral_segments(_post_mistral(part, samplerate, data), offset, labels, chunk)
+        offset += len(part) / samplerate
+    return segments
 
 
 def _can_parallelize() -> bool:

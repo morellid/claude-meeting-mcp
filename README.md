@@ -290,7 +290,7 @@ auto_generate = true        # suggest PV generation after transcription
 
 ### Using Mistral Voxtral (speaker diarization, EU)
 
-`mode = "mistral"` sends one mono mix of the recording to Mistral's Voxtral Mini Transcribe V2 in a single request (up to 3 hours). Voxtral separates speakers by voice, so the transcript has `Speaker 1`, `Speaker 2`, ... instead of `Remote`/`Local`, and that stays correct even when the mic picks up the speakers. Participant names are sent as `context_bias` so they are spelled correctly.
+`mode = "mistral"` sends one mono mix of the recording to Mistral's Voxtral Mini Transcribe V2 in one request, or in 25-minute chunks for longer recordings (the API allows 3600 audio-seconds per minute; a rate-limited request waits a minute and retries). Speaker numbers restart in every chunk, so one voice can get a different number in each chunk. Voxtral separates speakers by voice, so the transcript has `Speaker 1`, `Speaker 2`, ... instead of `Remote`/`Local`, and that stays correct even when the mic picks up the speakers. Participant names are sent as `context_bias` so they are spelled correctly.
 
 ```toml
 [transcription]
