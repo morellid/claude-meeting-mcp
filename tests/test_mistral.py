@@ -178,3 +178,43 @@ def test_transcribe_mistral_error_carries_the_api_message(monkeypatch):
     with patch("claude_meeting_mcp.transcriber.httpx.post", return_value=response):
         with pytest.raises(httpx.HTTPStatusError, match="bad bias"):
             _transcribe_mistral(_noise(1, 7), SR, [])
+
+
+def _ok(segments: list[dict]) -> MagicMock:
+    response = MagicMock()
+    response.json.return_value = {"segments": segments}
+    return response
+
+
+def test_transcribe_mistral_chunks_long_audio_and_keeps_chunk_speakers_apart(monkeypatch):
+    # The plan allows 3600 audio-seconds per minute, so one request over an hour
+    # is always a 429 (2026-10-21: a 68-minute meeting).
+    monkeypatch.setenv("MISTRAL_API_KEY", "k")
+    first = _ok([{"text": " A.", "start": 0.0, "end": 0.5, "speaker_id": "speaker_1"}])
+    second = _ok([{"text": " B.", "start": 0.0, "end": 0.5, "speaker_id": "speaker_1"}])
+    with (
+        patch("claude_meeting_mcp.transcriber.MISTRAL_MAX_CHUNK_SECONDS", 1),
+        patch("claude_meeting_mcp.transcriber.httpx.post", side_effect=[first, second]) as post,
+    ):
+        segments = _transcribe_mistral(_noise(1.5, 8), SR, [])
+
+    assert post.call_count == 2
+    assert [s["start"] for s in segments] == [0.0, 0.75]  # offset by the chunk start
+    # Speaker ids restart in every chunk, so the same id is not the same voice.
+    assert [s["speaker"] for s in segments] == ["Speaker 1", "Speaker 2"]
+
+
+def test_transcribe_mistral_waits_and_retries_on_rate_limit(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "k")
+    request = httpx.Request("POST", "https://api.mistral.ai/v1/audio/transcriptions")
+    limited = httpx.Response(429, request=request, text="rate limited")
+    ok = _ok([{"text": " Hi.", "start": 0.0, "end": 0.5, "speaker_id": "speaker_1"}])
+    with (
+        patch("claude_meeting_mcp.transcriber.httpx.post", side_effect=[limited, ok]) as post,
+        patch("claude_meeting_mcp.transcriber.time.sleep") as sleep,
+    ):
+        segments = _transcribe_mistral(_noise(1, 9), SR, [])
+
+    assert post.call_count == 2
+    sleep.assert_called_once()
+    assert [s["text"] for s in segments] == [" Hi."]
