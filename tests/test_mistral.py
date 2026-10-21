@@ -3,6 +3,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import numpy as np
 import pytest
 import soundfile as sf
@@ -14,6 +15,7 @@ from claude_meeting_mcp.transcriber import (
     _mistral_api_key,
     _mistral_segments,
     _mix_to_mono,
+    _transcribe_mistral,
     transcribe_meeting,
 )
 
@@ -150,3 +152,29 @@ def test_transcribe_meeting_mistral_failure_keeps_wav(tmp_path, monkeypatch):
             transcribe_meeting(str(wav))
 
     assert wav.exists()
+
+
+def test_transcribe_mistral_splits_full_names_into_single_word_bias_terms(monkeypatch):
+    # The API rejects a context_bias term containing whitespace with a 400
+    # (2026-10-21: "Benedek Szulyovszky" lost a 68-minute transcript).
+    monkeypatch.setenv("MISTRAL_API_KEY", "k")
+    response = MagicMock()
+    response.json.return_value = {"segments": []}
+    with patch("claude_meeting_mcp.transcriber.httpx.post", return_value=response) as post:
+        _transcribe_mistral(_noise(1, 6), SR, ["Benedek Szulyovszky", "Davide Morelli", "davide"])
+
+    assert post.call_args.kwargs["data"]["context_bias"] == [
+        "Benedek",
+        "Szulyovszky",
+        "Davide",
+        "Morelli",
+    ]
+
+
+def test_transcribe_mistral_error_carries_the_api_message(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "k")
+    request = httpx.Request("POST", "https://api.mistral.ai/v1/audio/transcriptions")
+    response = httpx.Response(400, request=request, text='{"message":"bad bias"}')
+    with patch("claude_meeting_mcp.transcriber.httpx.post", return_value=response):
+        with pytest.raises(httpx.HTTPStatusError, match="bad bias"):
+            _transcribe_mistral(_noise(1, 7), SR, [])

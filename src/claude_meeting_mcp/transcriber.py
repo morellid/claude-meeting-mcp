@@ -274,7 +274,7 @@ def _transcribe_mistral(audio: np.ndarray, samplerate: int, names: list[str]) ->
 
     Voxtral takes up to 3 hours per request, past the recording safety cap, so the
     file is never chunked. Known participant names go in as context_bias so they
-    are spelled right.
+    are spelled right, one word per term: the API rejects a term with whitespace.
     """
     path = _encode_for_upload(audio, samplerate)
     data: dict[str, str | list[str]] = {
@@ -282,8 +282,12 @@ def _transcribe_mistral(audio: np.ndarray, samplerate: int, names: list[str]) ->
         "diarize": "true",
         "timestamp_granularities": "segment",
     }
-    if names:
-        data["context_bias"] = names[:MISTRAL_MAX_CONTEXT_BIAS]
+    words: list[str] = []
+    for word in (w for name in names for w in name.split()):
+        if word.lower() not in {w.lower() for w in words}:
+            words.append(word)
+    if words:
+        data["context_bias"] = words[:MISTRAL_MAX_CONTEXT_BIAS]
     language = _resolve_language(get_config().transcription.language)
     if language:
         data["language"] = language
@@ -300,7 +304,13 @@ def _transcribe_mistral(audio: np.ndarray, samplerate: int, names: list[str]) ->
     finally:
         os.unlink(path)
 
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        # The status line alone hides the body, which is where the API says what is wrong.
+        raise httpx.HTTPStatusError(
+            f"{e}\n{response.text}", request=e.request, response=e.response
+        ) from e
     return _mistral_segments(response.json())
 
 
