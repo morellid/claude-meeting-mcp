@@ -47,7 +47,8 @@ cat > "$AGENT" <<PLIST
   <key>ProgramArguments</key><array><string>$APP/Contents/MacOS/AutoRecorder</string></array>
   <key>EnvironmentVariables</key><dict><key>MEETING_REPO</key><string>$REPO</string></dict>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>AbandonProcessGroup</key><true/>
   <key>ProcessType</key><string>Interactive</string>
 </dict>
 </plist>

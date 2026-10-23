@@ -65,7 +65,13 @@ class MacOSCapturer:
             raise RuntimeError(f"audiocap process died (exit code {rc}): {stderr.strip()}")
 
         self._process.send_signal(signal.SIGINT)
-        self._process.wait(timeout=10)
+        try:
+            self._process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # A hung audiocap must not keep the recording lock forever.
+            logger.error("audiocap did not stop within 10 s; killing it")
+            self._process.kill()
+            self._process.wait()
 
         # Log stderr warnings
         rc = self._process.returncode

@@ -135,15 +135,14 @@ def start_recording(live_translate: str | None = None, mcp_context=None, event_l
                 "this call, or another Claude session started a recording)."
             }
 
-        ensure_dirs()
-        filename = generate_filename()
-        filepath = RECORDINGS_DIR / filename
-        _current_file = str(filepath)
-
         try:
+            ensure_dirs()
+            filename = generate_filename()
+            filepath = RECORDINGS_DIR / filename
+            _current_file = str(filepath)
             capturer.start(_current_file)
             _capturer = capturer
-        except RuntimeError as e:
+        except Exception as e:  # noqa: BLE001 - any failure here must free the lock
             logger.error("Failed to start recording: %s", e)
             _release_device_lock()
             _current_file = None
@@ -230,14 +229,14 @@ def stop_recording() -> dict:
         try:
             _capturer.stop()
         except RuntimeError as e:
-            _release_device_lock()
             logger.error("Error stopping recording: %s", e)
             _capturer = None
             _current_file = None
             return {"error": str(e), "file": file_path}
+        finally:
+            _release_device_lock()
 
         logger.info("Recording stopped: %s", file_path)
-        _release_device_lock()
         _capturer = None
         _current_file = None
         return {"status": "stopped", "file": file_path}

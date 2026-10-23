@@ -156,8 +156,29 @@ def finish(wav_path: str, start: datetime, end: datetime, bundle_id: str) -> int
     title = event["summary"] if event else f"Unscheduled call ({_app_label(bundle_id)})"
     minutes = round((end - start).total_seconds() / 60)
 
+    # The sidecar goes down BEFORE transcribing: transcribe_meeting deletes the WAV
+    # as soon as the transcript is written, so a sidecar written afterwards could be
+    # lost with nothing left to retry. The router only files a sidecar once its
+    # transcript exists.
+    meeting_id = Path(wav_path).stem
+    sidecar = {
+        "meeting_id": meeting_id,
+        "event": title,
+        "calendar": event["calendar"] if event else None,
+        "attendees": names,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "app": bundle_id,
+        "filed": False,
+    }
+    TRANSCRIPTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    path = TRANSCRIPTIONS_DIR / f"{meeting_id}.auto.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
     try:
-        transcription = transcribe_meeting(wav_path, ", ".join(names) or None, SELF_NAME)
+        transcribe_meeting(wav_path, ", ".join(names) or None, SELF_NAME)
     except Exception as exc:  # noqa: BLE001
         kind, message = classify_error(exc)
         logger.exception("Transcription failed for %s", wav_path)
@@ -168,20 +189,8 @@ def finish(wav_path: str, start: datetime, end: datetime, bundle_id: str) -> int
         _emit({"status": "error", "kind": kind, "message": message})
         return 1
 
-    sidecar = {
-        "meeting_id": transcription.meeting_id,
-        "event": title,
-        "calendar": event["calendar"] if event else None,
-        "attendees": names,
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "app": bundle_id,
-        "filed": False,
-    }
-    path = TRANSCRIPTIONS_DIR / f"{transcription.meeting_id}.auto.json"
-    path.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
     notify(f"Recorded {title} ({minutes} min), transcribed. The agent router files the note.")
-    _emit({"status": "done", "meeting_id": transcription.meeting_id, "title": title})
+    _emit({"status": "done", "meeting_id": meeting_id, "title": title})
     return 0
 
 

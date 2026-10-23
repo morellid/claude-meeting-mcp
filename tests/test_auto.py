@@ -119,6 +119,8 @@ def test_finish_failure_reports_the_error_kind_and_keeps_going(tmp_path, capsys)
         code = auto.finish(str(wav), _dt("14:00"), _dt("14:20"), "com.google.Chrome.helper")
 
     assert code == 1
+    # The handoff is durable before transcription: Retry and the router still see it.
+    assert (tmp_path / "2026-10-26_14h00_meeting.auto.json").exists()
     result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert result == {"status": "error", "kind": "mistral_credits", "message": result["message"]}
     assert "credits" in result["message"].lower()

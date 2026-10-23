@@ -104,8 +104,11 @@ final class Controller {
 
     private let lock = DeviceLock()
     private var candidateSince: Date?
-    /// After a manual stop the call is still on: do not restart until the mic is free.
+    /// After a manual stop or the cap the call is still on: do not restart until the
+    /// mic is free (a Meet tab left open would otherwise record forever, 2 h at a time).
     private var suppressUntilMicFree = false
+    /// Stopped but audiocap not yet reaped: quit must still finish this one.
+    private var stopping: (recording: Recording, end: Date)?
 
     func tick() {
         let app = MicWatcher.callAppUsingMic()
@@ -122,12 +125,13 @@ final class Controller {
                 if !current.manual && idle > Controller.stopAfter {
                     stop(reason: "call ended")
                 } else if now.timeIntervalSince(current.start) > Controller.maxLength {
+                    suppressUntilMicFree = true
                     stop(reason: "2h cap")
                 }
             }
         } else {
             recordingElsewhere = lock.heldElsewhere()
-            if let app, !paused, !suppressUntilMicFree, !recordingElsewhere {
+            if let app, !paused, !suppressUntilMicFree, !recordingElsewhere, stopping == nil {
                 if let since = candidateSince {
                     if now.timeIntervalSince(since) >= Controller.startAfter {
                         candidateSince = nil
@@ -144,7 +148,7 @@ final class Controller {
     }
 
     func start(app: String, manual: Bool) {
-        guard recording == nil else { return }
+        guard recording == nil, stopping == nil else { return }
         guard lock.acquire() else {
             recordingElsewhere = true
             onChange()
@@ -183,10 +187,13 @@ final class Controller {
         if manualStop { suppressUntilMicFree = true }
         current.process.interrupt()  // SIGINT: audiocap finalises the WAV header
         let end = Date()
+        stopping = (current, end)
         log("recording stopped (\(reason)): \(current.file.lastPathComponent)")
         DispatchQueue.global().async { [self] in
             current.process.waitUntilExit()
             DispatchQueue.main.async { [self] in
+                guard stopping?.recording.file == current.file else { return }  // quit got it
+                stopping = nil
                 lock.release()
                 finishRecording(current, end: end)
             }
@@ -195,7 +202,14 @@ final class Controller {
     }
 
     /// Synchronous stop for quit/logout: the WAV must be complete before we exit.
+    /// The finish step is a child process that outlives the app (AbandonProcessGroup).
     func stopForExit() {
+        if let (current, end) = stopping {
+            stopping = nil
+            current.process.waitUntilExit()
+            lock.release()
+            finishRecording(current, end: end)
+        }
         guard let current = recording else { return }
         recording = nil
         current.process.interrupt()
