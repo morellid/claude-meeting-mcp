@@ -303,6 +303,16 @@ The key is read from `MISTRAL_API_KEY`, then from the macOS Keychain. MCP server
 security add-generic-password -a "$USER" -s MISTRAL_API_KEY -w
 ```
 
+### AutoRecorder: record every call automatically (macOS)
+
+`src/autorecorder` is a menu bar app that records calls without being asked. When a call app (Zoom, Meet or any browser call, Teams, Slack, Webex) holds the microphone for 8 s it starts `audiocap`; 90 s after the mic is released it stops and runs `meeting-auto finish`, which names the recording from the calendar (`gws`), transcribes it with the configured backend and writes `<meeting_id>.auto.json` for whatever files your notes. FaceTime and WhatsApp are deliberately not in the list. The icon shows the state: mic (waiting), red dot (recording), waveform (transcribing), orange triangle (an error, with Retry), slashed mic (paused). It shares an flock with the MCP recorder, so a call is never captured twice.
+
+```bash
+src/autorecorder/install.sh   # builds, installs ~/Applications/AutoRecorder.app, starts it at login
+```
+
+The first recording asks for microphone and system audio permission for AutoRecorder.
+
 ### Using a remote transcription API
 
 Instead of running Whisper locally, you can use any API that implements the OpenAI `/v1/audio/transcriptions` endpoint:
