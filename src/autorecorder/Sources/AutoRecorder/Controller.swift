@@ -15,15 +15,17 @@ enum Paths {
     static let log = home.appendingPathComponent("Library/Logs/AutoRecorder.log")
 }
 
+/// An O_APPEND handle on the log. The app and its child processes (audiocap, the
+/// Python finish step) all write here; without O_APPEND each writes at its own
+/// offset and they overwrite each other's lines.
+func logHandle() -> FileHandle? {
+    let fd = open(Paths.log.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    return fd >= 0 ? FileHandle(fileDescriptor: fd, closeOnDealloc: true) : nil
+}
+
 func log(_ message: String) {
     let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-    if let handle = try? FileHandle(forWritingTo: Paths.log) {
-        handle.seekToEndOfFile()
-        handle.write(Data(line.utf8))
-        try? handle.close()
-    } else {
-        try? line.write(to: Paths.log, atomically: true, encoding: .utf8)
-    }
+    logHandle()?.write(Data(line.utf8))
 }
 
 /// The machine-wide recording lock, the same flock the MCP recorder takes, so a
@@ -162,10 +164,9 @@ final class Controller {
         let process = Process()
         process.executableURL = Paths.audiocap
         process.arguments = ["--output", file.path]
-        let logHandle = try? FileHandle(forWritingTo: Paths.log)
-        logHandle?.seekToEndOfFile()
-        process.standardError = logHandle
-        process.standardOutput = logHandle
+        let handle = logHandle()
+        process.standardError = handle
+        process.standardOutput = handle
         do {
             try process.run()
         } catch {
@@ -300,9 +301,7 @@ final class Controller {
         process.environment = env
         let stdout = Pipe()
         process.standardOutput = stdout
-        let logHandle = try? FileHandle(forWritingTo: Paths.log)
-        logHandle?.seekToEndOfFile()
-        process.standardError = logHandle
+        process.standardError = logHandle()
         process.terminationHandler = { _ in
             let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             let last = output.split(separator: "\n").last.map(String.init) ?? ""
