@@ -31,6 +31,7 @@ diarization = ["pyannote-audio>=3.1.0", "torch>=2.0.0"]
 [project.scripts]
 claude-meeting-mcp = "claude_meeting_mcp.server:main"
 transcribe = "claude_meeting_mcp.transcriber:cli"
+meeting-auto = "claude_meeting_mcp.auto:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -3,15 +3,57 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Callable
 
 from .capture import get_capturer
 from .config import RecordingConfig, get_config
-from .storage import RECORDINGS_DIR, TRANSCRIPTIONS_DIR, ensure_dirs, generate_filename
+from .storage import (
+    RECORDINGS_DIR,
+    TRANSCRIPTIONS_DIR,
+    _get_data_dir,
+    ensure_dirs,
+    generate_filename,
+)
 
 logger = logging.getLogger(__name__)
+
+_device_lock_fd: int | None = None
+
+
+def _acquire_device_lock() -> bool:
+    """Take the machine-wide recording lock, shared with the auto-recorder app.
+
+    Every Claude session runs its own MCP server, and the menu bar app records
+    calls on its own, so an in-process flag cannot stop two of them capturing the
+    same call. An flock on a file in the data dir can, and the kernel drops it if
+    the holder dies. No-op where fcntl does not exist (Windows has no auto-recorder).
+    """
+    global _device_lock_fd
+    try:
+        import fcntl
+    except ImportError:
+        return True
+    data_dir = _get_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(data_dir / "recording.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    _device_lock_fd = fd
+    return True
+
+
+def _release_device_lock() -> None:
+    global _device_lock_fd
+    if _device_lock_fd is not None:
+        os.close(_device_lock_fd)  # closing the descriptor releases the flock
+        _device_lock_fd = None
+
 
 _lock = threading.RLock()  # Reentrant: _auto_stop calls stop_recording from Timer thread
 _capturer = None
@@ -87,6 +129,12 @@ def start_recording(live_translate: str | None = None, mcp_context=None, event_l
         if not capturer.is_available():
             return {"error": "Audio capture not available on this platform. Check installation."}
 
+        if not _acquire_device_lock():
+            return {
+                "error": "Another recorder is already recording (the auto-recorder caught "
+                "this call, or another Claude session started a recording)."
+            }
+
         ensure_dirs()
         filename = generate_filename()
         filepath = RECORDINGS_DIR / filename
@@ -97,6 +145,7 @@ def start_recording(live_translate: str | None = None, mcp_context=None, event_l
             _capturer = capturer
         except RuntimeError as e:
             logger.error("Failed to start recording: %s", e)
+            _release_device_lock()
             _current_file = None
             return {"error": str(e)}
 
@@ -181,12 +230,14 @@ def stop_recording() -> dict:
         try:
             _capturer.stop()
         except RuntimeError as e:
+            _release_device_lock()
             logger.error("Error stopping recording: %s", e)
             _capturer = None
             _current_file = None
             return {"error": str(e), "file": file_path}
 
         logger.info("Recording stopped: %s", file_path)
+        _release_device_lock()
         _capturer = None
         _current_file = None
         return {"status": "stopped", "file": file_path}

@@ -167,3 +167,51 @@ def test_get_capturer_returns_macos():
 
         capturer = get_capturer()
         assert isinstance(capturer, MacOSCapturer)
+
+
+def _hold_device_lock(data_dir):
+    """Take the shared recording lock the way the auto-recorder app does."""
+    import fcntl
+    import os
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(data_dir / "recording.lock", os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+@patch("claude_meeting_mcp.recorder.get_capturer")
+@patch("claude_meeting_mcp.recorder._capturer", None)
+@patch("claude_meeting_mcp.recorder._current_file", None)
+def test_start_refused_while_another_recorder_holds_the_lock(mock_get, tmp_path):
+    """The auto-recorder and a Claude session must never capture the same call twice."""
+    import os
+
+    mock_get.return_value = MagicMock(**{"is_available.return_value": True})
+    fd = _hold_device_lock(tmp_path)
+    try:
+        result = start_recording()
+    finally:
+        os.close(fd)
+    assert "already recording" in result["error"]
+    mock_get.return_value.start.assert_not_called()
+
+
+@patch("claude_meeting_mcp.recorder.get_capturer")
+@patch("claude_meeting_mcp.recorder._capturer", None)
+@patch("claude_meeting_mcp.recorder._current_file", None)
+def test_lock_held_while_recording_and_released_on_stop(mock_get, tmp_path):
+    import fcntl
+    import os
+
+    mock_get.return_value = MagicMock(**{"is_available.return_value": True})
+    assert start_recording()["status"] == "recording"
+    try:
+        _hold_device_lock(tmp_path)
+        raise AssertionError("lock should be held during the recording")
+    except BlockingIOError:
+        pass
+    stop_recording()
+    fd = _hold_device_lock(tmp_path)  # free again
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
