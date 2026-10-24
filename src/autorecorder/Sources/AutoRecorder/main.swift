@@ -1,4 +1,5 @@
 import AppKit
+import UserNotifications
 
 // =============================================================================
 // AutoRecorder - menu bar app that records every call automatically
@@ -10,7 +11,9 @@ import AppKit
 // router to file. The menu bar icon shows the state; errors offer a retry.
 // =============================================================================
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
+    UNUserNotificationCenterDelegate
+{
     private let controller = Controller()
     private var statusItem: NSStatusItem!
     private var timers: [Timer] = []
@@ -22,6 +25,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         controller.onChange = { [weak self] in self?.updateIcon() }
+        controller.onEvent = { [weak self] title, body in self?.notify(title, body) }
+        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            log("notifications \(granted ? "allowed" : "not allowed")")
+        }
 
         timers.append(Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             self?.controller.tick()
@@ -46,6 +54,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         controller.stopForExit()
         log("AutoRecorder quit")
+    }
+
+    // MARK: - Notifications
+
+    private func notify(_ title: String, _ body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Show banners even though an accessory app is never "in the foreground".
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list])
     }
 
     // MARK: - Icon
@@ -95,7 +121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if let rec = controller.recording {
             let minutes = Int(Date().timeIntervalSince(rec.start) / 60)
-            info("Recording \(rec.manual ? "(started by hand)" : appName(rec.app)) - \(minutes) min")
+            info("Recording \(Controller.describe(rec.app)) - \(minutes) min")
         } else if controller.recordingElsewhere {
             info("Recording from a Claude session")
         } else if controller.paused {
@@ -131,12 +157,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         action("Open Transcripts Folder", #selector(openTranscripts))
         action("Open Log", #selector(openLog))
         action("Quit AutoRecorder", #selector(quit))
-    }
-
-    private func appName(_ bundle: String) -> String {
-        let names = ["us.zoom.": "Zoom call", "com.google.Chrome": "browser call (Chrome)",
-                     "com.microsoft.teams": "Teams call", "com.tinyspeck.slackmacgap": "Slack huddle"]
-        return names.first { bundle.hasPrefix($0.key) }?.value ?? "call (\(bundle))"
     }
 
     @objc private func stopRecording() { controller.stop(reason: "stopped by hand", manualStop: true) }

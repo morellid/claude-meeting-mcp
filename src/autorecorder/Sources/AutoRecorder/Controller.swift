@@ -103,6 +103,15 @@ final class Controller {
     }
 
     var onChange: () -> Void = {}
+    /// Something the user should see as a notification: (title, body).
+    var onEvent: (String, String) -> Void = { _, _ in }
+
+    static func describe(_ bundle: String) -> String {
+        let names = ["us.zoom.": "Zoom call", "com.google.Chrome": "browser call (Chrome)",
+                     "com.microsoft.teams": "Teams call", "com.tinyspeck.slackmacgap": "Slack huddle",
+                     "manual": "started by hand"]
+        return names.first { bundle.hasPrefix($0.key) }?.value ?? "call (\(bundle))"
+    }
 
     private let lock = DeviceLock()
     private var candidateSince: Date?
@@ -179,6 +188,7 @@ final class Controller {
         recording = Recording(file: file, start: Date(), app: app, process: process,
                               manual: manual, lastSeen: Date())
         log("recording started (\(manual ? "manual" : app)): \(file.lastPathComponent)")
+        onEvent("Recording started", Controller.describe(app))
         onChange()
     }
 
@@ -190,6 +200,12 @@ final class Controller {
         let end = Date()
         stopping = (current, end)
         log("recording stopped (\(reason)): \(current.file.lastPathComponent)")
+        let length = end.timeIntervalSince(current.start)
+        if length < Controller.minLength {
+            onEvent("Recording discarded", "Under a minute, nothing to transcribe.")
+        } else {
+            onEvent("Recording stopped", "\(Int(length / 60)) min, \(reason). Transcribing now.")
+        }
         DispatchQueue.global().async { [self] in
             current.process.waitUntilExit()
             DispatchQueue.main.async { [self] in
@@ -253,6 +269,7 @@ final class Controller {
             [self] result in
             transcribing.removeAll { $0 == name }
             if result["status"] as? String == "done" {
+                onEvent("Transcribed", "\(result["title"] as? String ?? name). The router files the note.")
                 lastDone = "\(result["title"] as? String ?? name) at "
                     + DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
                 failures.removeAll { $0.file == file }
@@ -271,6 +288,7 @@ final class Controller {
         failures.append(failure)
         if failure.kind.hasPrefix("mistral") { mistralProblem = failure.message }
         log("failure [\(failure.kind)]: \(failure.message)")
+        onEvent("AutoRecorder needs attention", failure.message)
         onChange()
     }
 
@@ -285,8 +303,12 @@ final class Controller {
 
     func checkMistral() {
         runPython(["check"]) { [self] result in
-            mistralProblem = result["status"] as? String == "ok"
+            let problem = result["status"] as? String == "ok"
                 ? nil : (result["message"] as? String ?? "Mistral check failed; see the log.")
+            if let problem, problem != mistralProblem {  // once per new problem, not every 6 h
+                onEvent("Mistral problem", problem)
+            }
+            mistralProblem = problem
             onChange()
         }
     }
