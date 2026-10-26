@@ -124,8 +124,15 @@ final class Controller {
     /// Stopped but audiocap not yet reaped: quit must still finish this one.
     private var stopping: (recording: Recording, end: Date)?
 
+    private var lastInputUsers: [String] = []
+
     func tick() {
-        let app = MicWatcher.callAppUsingMic()
+        let users = MicWatcher.inputUsers()
+        if users != lastInputUsers {
+            log("mic users: \(users.isEmpty ? "none" : users.joined(separator: ", "))")
+            lastInputUsers = users
+        }
+        let app = MicWatcher.callApp(in: users)
         if app == nil { suppressUntilMicFree = false }
         let now = Date()
 

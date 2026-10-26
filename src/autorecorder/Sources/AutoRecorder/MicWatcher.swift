@@ -27,17 +27,19 @@ enum MicWatcher {
         "Cisco-Systems.Spark",
     ]
 
-    static func callAppUsingMic() -> String? {
-        for process in processObjects() {
-            guard property(process, kAudioProcessPropertyIsRunningInput, UInt32(0)) == 1 else {
-                continue
-            }
-            let bundle = bundleID(process)
-            if callApps.contains(where: { bundle.hasPrefix($0) }) {
-                return bundle
-            }
-        }
-        return nil
+    /// The first call app among the processes using the mic.
+    static func callApp(in users: [String]) -> String? {
+        users.first { bundle in callApps.contains(where: { bundle.hasPrefix($0) }) }
+    }
+
+    /// Bundle ids of every process running input right now, call app or not.
+    /// Logged on change, so an app that should trigger a recording but does not
+    /// shows its real id in the log.
+    static func inputUsers() -> [String] {
+        processObjects()
+            .filter { property($0, kAudioProcessPropertyIsRunningInput, UInt32(0)) == 1 }
+            .map(bundleID)
+            .sorted()
     }
 
     private static func processObjects() -> [AudioObjectID] {
