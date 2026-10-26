@@ -17,6 +17,10 @@ final class StereoRecorder {
     // stream for the rest of the meeting. All mic state is touched on writerQueue only.
     private var micDeviceID: AudioObjectID = kAudioObjectUnknown
     private var micSink: MicSink
+    /// Every sink an IOProc ever pointed at, kept until the recording ends:
+    /// AudioDeviceStop from another thread does not wait for an in-flight callback,
+    /// so freeing a replaced sink could crash mid-meeting. ~1 MB each, rebuilds are rare.
+    private var retiredSinks: [MicSink] = []
     private var micProcID: AudioDeviceIOProcID?
     private var micListener: AudioObjectPropertyListenerBlock?
     private var defaultInputListener: AudioObjectPropertyListenerBlock?
@@ -143,7 +147,7 @@ final class StereoRecorder {
         fputs("audiocap: System IOProc started\n", stderr)
 
         // --- Microphone IOProc (on default input device), and follow changes ---
-        writerQueue.sync { startMic() }
+        // Listen first, then resolve the device: a change in between still triggers.
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             self?.scheduleMicRebuild("default input device changed")
         }
@@ -151,6 +155,7 @@ final class StereoRecorder {
         AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &address, writerQueue, listener)
         defaultInputListener = listener
+        writerQueue.sync { startMic() }
 
         startWriterTimer()
         fputs("audiocap: Recording started\n", stderr)
@@ -371,8 +376,22 @@ final class StereoRecorder {
         micSampleRate = StereoRecorder.getDeviceSampleRate(micDeviceID) ?? sampleRate
         resampleRatio = micSampleRate / sampleRate  // e.g. 44100/48000 = 0.91875
         resamplePhase = 0
+        retiredSinks.append(micSink)
         micSink = MicSink(seconds: 5, sampleRate: micSampleRate)
         fputs("audiocap: Mic device: \(micDeviceID), \(micSampleRate) Hz\n", stderr)
+
+        // Watch this device's format BEFORE starting it: voice processing or a
+        // Bluetooth call mode changes rate or channel layout without changing the
+        // default device, and a device that fails to start now (mid-negotiation)
+        // must still trigger a rebuild when it settles.
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.scheduleMicRebuild("mic format changed")
+        }
+        for (selector, scope) in StereoRecorder.micWatched {
+            var address = StereoRecorder.address(selector, scope)
+            AudioObjectAddPropertyListenerBlock(micDeviceID, &address, writerQueue, listener)
+        }
+        micListener = listener
 
         var procID: AudioDeviceIOProcID?
         var status = AudioDeviceCreateIOProcID(
@@ -397,17 +416,6 @@ final class StereoRecorder {
         }
         micProcID = procID
         fputs("audiocap: Mic IOProc started\n", stderr)
-
-        // Follow this device's format: voice processing or a Bluetooth call mode
-        // changes rate or channel layout without changing the default device.
-        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.scheduleMicRebuild("mic format changed")
-        }
-        for (selector, scope) in StereoRecorder.micWatched {
-            var address = StereoRecorder.address(selector, scope)
-            AudioObjectAddPropertyListenerBlock(micDeviceID, &address, writerQueue, listener)
-        }
-        micListener = listener
     }
 
     private func stopMic() {
