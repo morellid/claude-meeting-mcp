@@ -122,6 +122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         if let rec = controller.recording {
             let minutes = Int(Date().timeIntervalSince(rec.start) / 60)
             info("Recording \(Controller.describe(rec.app)) - \(minutes) min")
+            if let since = controller.silentSince {
+                info("Silent since \(DateFormatter.localizedString(from: since, dateStyle: .none, timeStyle: .short))")
+            }
         } else if controller.recordingElsewhere {
             info("Recording from a Claude session")
         } else if controller.paused {

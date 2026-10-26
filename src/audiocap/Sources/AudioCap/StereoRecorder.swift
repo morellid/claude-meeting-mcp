@@ -11,10 +11,16 @@ final class StereoRecorder {
     private let systemRing: RingBuffer
     private var systemProcID: AudioDeviceIOProcID?
 
-    // Microphone (default input device)
-    private let micDeviceID: AudioObjectID
-    private let micRing: RingBuffer
+    // Microphone (default input device). Rebuilt whenever the default input, its
+    // sample rate or its channel layout changes: a call app switching the route
+    // (AirPods into call mode, voice processing) used to leave us reading a dead
+    // stream for the rest of the meeting. All mic state is touched on writerQueue only.
+    private var micDeviceID: AudioObjectID = kAudioObjectUnknown
+    private var micSink: MicSink
     private var micProcID: AudioDeviceIOProcID?
+    private var micListener: AudioObjectPropertyListenerBlock?
+    private var defaultInputListener: AudioObjectPropertyListenerBlock?
+    private var pendingRebuild: DispatchWorkItem?
 
     // Output
     private let outputPath: String
@@ -25,8 +31,8 @@ final class StereoRecorder {
     // Format
     private let sampleRate: Double
     private let systemChannels: Int
-    private let micSampleRate: Double       // native mic rate (may differ from system)
-    private let resampleRatio: Double       // micSampleRate / sampleRate
+    private var micSampleRate: Double       // native mic rate (may differ from system)
+    private var resampleRatio: Double       // micSampleRate / sampleRate
     private var resamplePhase: Double = 0.0 // fractional position in mic buffer
 
     // Audio processing chain: normalize → compress → limit
@@ -48,6 +54,20 @@ final class StereoRecorder {
     // Limiter: hard ceiling to prevent clipping
     private let limiterCeiling: Float = 0.95 // ~-0.5dB
 
+    // Level watch, on RAW samples (before the gain chain). Prints a level line every
+    // minute, and SILENT when neither channel has passed -55 dBFS for two minutes,
+    // which the AutoRecorder app turns into a notification. A stalled tap (no
+    // frames at all) counts as silence too.
+    private static let audibleRMS: Float = 0.0018      // ~-55 dBFS
+    private static let silentAfter: UInt64 = 120       // seconds
+    private var lastAudible = DispatchTime.now().uptimeNanoseconds
+    private var lastSystemFrames = DispatchTime.now().uptimeNanoseconds
+    private var reportedSilent = false
+    private var reportedStall = false
+    private var windowStart = DispatchTime.now().uptimeNanoseconds
+    private var windowSysMax: Float = 0
+    private var windowMicMax: Float = 0
+
     init(
         aggregateID: AudioObjectID,
         outputPath: String,
@@ -60,23 +80,17 @@ final class StereoRecorder {
 
         // Ring buffers: ~5 seconds each
         let sysCapacity = Int(sampleRate) * systemChannels * 5 * MemoryLayout<Float>.size
-        let micCapacity = Int(sampleRate) * 1 * 5 * MemoryLayout<Float>.size  // mono mic
         self.systemRing = RingBuffer(capacity: sysCapacity)
-        self.micRing = RingBuffer(capacity: micCapacity)
 
         // Compressor envelope coefficients (attack 5ms, release 100ms)
         self.attackCoeff = expf(-1.0 / (Float(sampleRate) * 0.005))
         self.releaseCoeff = expf(-1.0 / (Float(sampleRate) * 0.100))
 
-        // Find default input device
-        self.micDeviceID = try StereoRecorder.getDefaultInputDevice()
-        self.micSampleRate = StereoRecorder.getDeviceSampleRate(micDeviceID) ?? sampleRate
-        self.resampleRatio = micSampleRate / sampleRate  // e.g. 44100/48000 = 0.91875
+        // The mic is resolved in startMic(); until then, a placeholder.
+        self.micSampleRate = sampleRate
+        self.resampleRatio = 1.0
+        self.micSink = MicSink(seconds: 5, sampleRate: sampleRate)
         fputs("audiocap: System: \(sampleRate) Hz, \(systemChannels) ch\n", stderr)
-        fputs("audiocap: Mic device: \(micDeviceID), \(micSampleRate) Hz\n", stderr)
-        if resampleRatio != 1.0 {
-            fputs("audiocap: Mic resample ratio: \(resampleRatio) (software interpolation)\n", stderr)
-        }
 
         // Create WAV: stereo 16-bit at tap sample rate
         let settings: [String: Any] = [
@@ -128,36 +142,15 @@ final class StereoRecorder {
         }
         fputs("audiocap: System IOProc started\n", stderr)
 
-        // --- Microphone IOProc (on default input device) ---
-        let micClientData = Unmanaged.passUnretained(self.micRing).toOpaque()
-        var mProcID: AudioDeviceIOProcID?
-        status = AudioDeviceCreateIOProcID(
-            micDeviceID,
-            { (_, _, inInputData, _, _, _, inClientData) -> OSStatus in
-                guard let cd = inClientData else { return noErr }
-                let ring = Unmanaged<RingBuffer>.fromOpaque(cd).takeUnretainedValue()
-                let buf = inInputData.pointee.mBuffers
-                guard let data = buf.mData, buf.mDataByteSize > 0 else { return noErr }
-                // Mic may be multi-channel but we only take first channel's worth
-                ring.writeBytes(data, count: Int(buf.mDataByteSize))
-                return noErr
-            },
-            micClientData,
-            &mProcID
-        )
-        guard status == noErr, let mProcID else {
-            throw AudioCapError.ioProcFailed(status)
+        // --- Microphone IOProc (on default input device), and follow changes ---
+        writerQueue.sync { startMic() }
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.scheduleMicRebuild("default input device changed")
         }
-        self.micProcID = mProcID
-
-        status = AudioDeviceStart(micDeviceID, mProcID)
-        if status != noErr {
-            fputs("audiocap: Mic start failed (\(status)), recording system audio only\n", stderr)
-            AudioDeviceDestroyIOProcID(micDeviceID, mProcID)
-            self.micProcID = nil
-        } else {
-            fputs("audiocap: Mic IOProc started\n", stderr)
-        }
+        var address = StereoRecorder.address(kAudioHardwarePropertyDefaultInputDevice)
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, writerQueue, listener)
+        defaultInputListener = listener
 
         startWriterTimer()
         fputs("audiocap: Recording started\n", stderr)
@@ -172,14 +165,19 @@ final class StereoRecorder {
             AudioDeviceDestroyIOProcID(tapDeviceID, procID)
             systemProcID = nil
         }
-        if let procID = micProcID {
-            AudioDeviceStop(micDeviceID, procID)
-            AudioDeviceDestroyIOProcID(micDeviceID, procID)
-            micProcID = nil
+        if let listener = defaultInputListener {
+            var address = StereoRecorder.address(kAudioHardwarePropertyDefaultInputDevice)
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address, writerQueue, listener)
+            defaultInputListener = nil
         }
 
         // Final drain
-        writerQueue.sync { self.drainBuffers() }
+        writerQueue.sync {
+            self.pendingRebuild?.cancel()
+            self.stopMic()
+            self.drainBuffers()
+        }
 
         audioFile = nil
         fputs("audiocap: Recording stopped\n", stderr)
@@ -192,6 +190,7 @@ final class StereoRecorder {
         timer.schedule(deadline: .now(), repeating: .milliseconds(10))
         timer.setEventHandler { [weak self] in
             self?.drainBuffers()
+            self?.checkLevels()
         }
         timer.resume()
         writerTimer = timer
@@ -207,6 +206,8 @@ final class StereoRecorder {
         // Read system audio
         let sysAvailable = systemRing.availableBytesToRead
         guard sysAvailable > 0 else { return }
+        lastSystemFrames = DispatchTime.now().uptimeNanoseconds
+        let micRing = micSink.ring
 
         let maxFrames = 4096
         let maxSysBytes = maxFrames * sysBytesPerFrame
@@ -294,6 +295,11 @@ final class StereoRecorder {
             // === Step 2: Normalize — bring both channels to target RMS ===
             let chunkSysRMS = sqrtf(sysSum / Float(max(frameCount, 1)))
             let chunkMicRMS = sqrtf(micSum / Float(max(frameCount, 1)))
+            windowSysMax = max(windowSysMax, chunkSysRMS)
+            windowMicMax = max(windowMicMax, chunkMicRMS)
+            if max(chunkSysRMS, chunkMicRMS) > StereoRecorder.audibleRMS {
+                lastAudible = DispatchTime.now().uptimeNanoseconds
+            }
             systemRMS += (chunkSysRMS - systemRMS) * rmsSmoothing
             micRMS += (chunkMicRMS - micRMS) * rmsSmoothing
 
@@ -353,7 +359,132 @@ final class StereoRecorder {
         return sample
     }
 
+    // MARK: - Mic lifecycle (writerQueue only)
+
+    private func startMic() {
+        do {
+            micDeviceID = try StereoRecorder.getDefaultInputDevice()
+        } catch {
+            fputs("audiocap: MIC LOST: no default input device\n", stderr)
+            return
+        }
+        micSampleRate = StereoRecorder.getDeviceSampleRate(micDeviceID) ?? sampleRate
+        resampleRatio = micSampleRate / sampleRate  // e.g. 44100/48000 = 0.91875
+        resamplePhase = 0
+        micSink = MicSink(seconds: 5, sampleRate: micSampleRate)
+        fputs("audiocap: Mic device: \(micDeviceID), \(micSampleRate) Hz\n", stderr)
+
+        var procID: AudioDeviceIOProcID?
+        var status = AudioDeviceCreateIOProcID(
+            micDeviceID,
+            { (_, _, inInputData, _, _, _, inClientData) -> OSStatus in
+                guard let cd = inClientData else { return noErr }
+                Unmanaged<MicSink>.fromOpaque(cd).takeUnretainedValue().write(inInputData)
+                return noErr
+            },
+            Unmanaged.passUnretained(micSink).toOpaque(),
+            &procID
+        )
+        guard status == noErr, let procID else {
+            fputs("audiocap: MIC LOST: IOProc failed (\(status))\n", stderr)
+            return
+        }
+        status = AudioDeviceStart(micDeviceID, procID)
+        guard status == noErr else {
+            fputs("audiocap: MIC LOST: start failed (\(status)), system audio only\n", stderr)
+            AudioDeviceDestroyIOProcID(micDeviceID, procID)
+            return
+        }
+        micProcID = procID
+        fputs("audiocap: Mic IOProc started\n", stderr)
+
+        // Follow this device's format: voice processing or a Bluetooth call mode
+        // changes rate or channel layout without changing the default device.
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.scheduleMicRebuild("mic format changed")
+        }
+        for (selector, scope) in StereoRecorder.micWatched {
+            var address = StereoRecorder.address(selector, scope)
+            AudioObjectAddPropertyListenerBlock(micDeviceID, &address, writerQueue, listener)
+        }
+        micListener = listener
+    }
+
+    private func stopMic() {
+        if let listener = micListener {
+            for (selector, scope) in StereoRecorder.micWatched {
+                var address = StereoRecorder.address(selector, scope)
+                AudioObjectRemovePropertyListenerBlock(micDeviceID, &address, writerQueue, listener)
+            }
+            micListener = nil
+        }
+        if let procID = micProcID {
+            AudioDeviceStop(micDeviceID, procID)
+            AudioDeviceDestroyIOProcID(micDeviceID, procID)
+            micProcID = nil
+        }
+    }
+
+    /// Several properties fire together on one route change; rebuild once.
+    private func scheduleMicRebuild(_ reason: String) {
+        pendingRebuild?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.writerTimer != nil else { return }
+            fputs("audiocap: \(reason), rebuilding mic\n", stderr)
+            self.stopMic()
+            self.startMic()
+        }
+        pendingRebuild = work
+        writerQueue.asyncAfter(deadline: .now() + .milliseconds(300), execute: work)
+    }
+
+    private static let micWatched: [(AudioObjectPropertySelector, AudioObjectPropertyScope)] = [
+        (kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal),
+        (kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeInput),
+        (kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal),
+    ]
+
+    // MARK: - Level watch (writerQueue only)
+
+    private func checkLevels() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let second: UInt64 = 1_000_000_000
+
+        if now - lastSystemFrames > 5 * second, !reportedStall {
+            fputs("audiocap: STALLED system tap delivered nothing for 5 s\n", stderr)
+            reportedStall = true
+        } else if now - lastSystemFrames <= 5 * second {
+            reportedStall = false
+        }
+
+        let silentFor = (now - lastAudible) / second
+        if silentFor >= StereoRecorder.silentAfter, !reportedSilent {
+            fputs("audiocap: SILENT both channels below -55 dBFS for \(silentFor) s\n", stderr)
+            reportedSilent = true
+        } else if silentFor < StereoRecorder.silentAfter, reportedSilent {
+            fputs("audiocap: AUDIO back\n", stderr)
+            reportedSilent = false
+        }
+
+        if now - windowStart >= 60 * second {
+            fputs(String(format: "audiocap: levels sys=%.1f mic=%.1f dBFS (loudest chunk, last minute, raw)\n",
+                         StereoRecorder.dbfs(windowSysMax), StereoRecorder.dbfs(windowMicMax)), stderr)
+            windowStart = now
+            windowSysMax = 0
+            windowMicMax = 0
+        }
+    }
+
+    private static func dbfs(_ rms: Float) -> Float { rms > 0 ? 20 * log10f(rms) : -120 }
+
     // MARK: - Helpers
+
+    private static func address(
+        _ selector: AudioObjectPropertySelector,
+        _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+    ) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    }
 
     private static func getDefaultInputDevice() throws -> AudioObjectID {
         var deviceID: AudioObjectID = kAudioObjectUnknown
@@ -382,5 +513,35 @@ final class StereoRecorder {
         )
         let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &rate)
         return status == noErr ? rate : nil
+    }
+}
+
+/// What the mic IOProc writes into; replaced with the IOProc on every mic rebuild.
+final class MicSink {
+    let ring: RingBuffer
+    private let scratch: UnsafeMutablePointer<Float32>
+    private let scratchFrames = 16384
+
+    init(seconds: Int, sampleRate: Double) {
+        ring = RingBuffer(capacity: Int(sampleRate) * seconds * MemoryLayout<Float32>.size)
+        scratch = .allocate(capacity: scratchFrames)
+    }
+
+    deinit { scratch.deallocate() }
+
+    /// Keeps channel 0 only. A multichannel input interleaves its channels, and
+    /// writing them all into a mono ring plays the mic at N times its rate.
+    func write(_ list: UnsafePointer<AudioBufferList>) {
+        let buf = list.pointee.mBuffers
+        guard let data = buf.mData, buf.mDataByteSize > 0 else { return }
+        let channels = Int(max(buf.mNumberChannels, 1))
+        if channels == 1 {
+            ring.writeBytes(data, count: Int(buf.mDataByteSize))
+            return
+        }
+        let frames = min(Int(buf.mDataByteSize) / (MemoryLayout<Float32>.size * channels), scratchFrames)
+        let source = data.assumingMemoryBound(to: Float32.self)
+        for f in 0..<frames { scratch[f] = source[f * channels] }
+        ring.writeBytes(scratch, count: frames * MemoryLayout<Float32>.size)
     }
 }

@@ -33,6 +33,8 @@ APP_LABELS = {
     "com.google.Chrome": "Chrome",
     "com.microsoft.teams": "Teams",
     "com.tinyspeck.slackmacgap": "Slack",
+    "net.whatsapp.": "WhatsApp",
+    "desktop.WhatsApp": "WhatsApp",
 }
 
 

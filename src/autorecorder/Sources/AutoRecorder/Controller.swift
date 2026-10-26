@@ -97,6 +97,8 @@ final class Controller {
     private(set) var failures: [Failure] = []
     private(set) var mistralProblem: String?
     private(set) var lastDone: String?
+    /// Set while audiocap reports that neither channel has heard anything.
+    private(set) var silentSince: Date?
     var paused: Bool {
         get { UserDefaults.standard.bool(forKey: "paused") }
         set { UserDefaults.standard.set(newValue, forKey: "paused") }
@@ -109,6 +111,7 @@ final class Controller {
     static func describe(_ bundle: String) -> String {
         let names = ["us.zoom.": "Zoom call", "com.google.Chrome": "browser call (Chrome)",
                      "com.microsoft.teams": "Teams call", "com.tinyspeck.slackmacgap": "Slack huddle",
+                     "net.whatsapp.": "WhatsApp call", "desktop.WhatsApp": "WhatsApp call",
                      "manual": "started by hand"]
         return names.first { bundle.hasPrefix($0.key) }?.value ?? "call (\(bundle))"
     }
@@ -173,9 +176,9 @@ final class Controller {
         let process = Process()
         process.executableURL = Paths.audiocap
         process.arguments = ["--output", file.path]
-        let handle = logHandle()
-        process.standardError = handle
-        process.standardOutput = handle
+        process.standardOutput = logHandle()
+        process.standardError = watchCapture()
+        silentSince = nil
         do {
             try process.run()
         } catch {
@@ -233,6 +236,47 @@ final class Controller {
         current.process.waitUntilExit()
         lock.release()
         finishRecording(current, end: Date())
+    }
+
+    /// A pipe for audiocap's stderr: every line goes to the log, and the level
+    /// watch lines (SILENT, AUDIO back, MIC LOST) become notifications. This is
+    /// what turns "the transcript came back empty" into a warning during the call.
+    private func watchCapture() -> Pipe {
+        let pipe = Pipe()
+        let log = logHandle()
+        var pending = ""
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            log?.write(data)
+            pending += String(decoding: data, as: UTF8.self)
+            while let newline = pending.firstIndex(of: "\n") {
+                let line = String(pending[..<newline])
+                pending.removeSubrange(...newline)
+                DispatchQueue.main.async { self?.captureSaid(line) }
+            }
+        }
+        return pipe
+    }
+
+    private func captureSaid(_ line: String) {
+        guard recording != nil else { return }
+        if line.hasPrefix("audiocap: SILENT") {
+            silentSince = Date().addingTimeInterval(-120)
+            onEvent("Recording is silent",
+                    "Nothing on either channel for 2 minutes. Check the mic and where the call's audio goes.")
+        } else if line.hasPrefix("audiocap: AUDIO back"), silentSince != nil {
+            silentSince = nil
+            onEvent("Audio is back", "The recording is picking up sound again.")
+        } else if line.hasPrefix("audiocap: MIC LOST") {
+            onEvent("Microphone lost", "Recording continues with the call audio only.")
+        } else {
+            return
+        }
+        onChange()
     }
 
     private func captureDied(_ current: Recording) {

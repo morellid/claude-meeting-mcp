@@ -5,12 +5,15 @@ import Foundation
 ///
 /// Core Audio lists every process with an audio session and whether it is
 /// running input (macOS 14.4+). No permission is needed to read it. Only call
-/// apps count: Siri (com.apple.CoreSpeech) holds the mic all day, and personal
-/// call apps (FaceTime, WhatsApp) are deliberately absent so they never record.
+/// apps count: Siri (com.apple.CoreSpeech) holds the mic all day, and FaceTime
+/// is deliberately absent so personal calls there never record.
 enum MicWatcher {
     /// Bundle id prefixes of apps whose mic use means "a meeting is on".
     /// Browsers capture through helper processes (com.google.Chrome.helper).
+    /// WhatsApp was added on 2026-10-26 at Davide's request; FaceTime stays out.
     static let callApps = [
+        "net.whatsapp.",
+        "desktop.WhatsApp",
         "us.zoom.",
         "com.google.Chrome",
         "com.microsoft.teams",
