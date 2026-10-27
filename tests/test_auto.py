@@ -141,3 +141,23 @@ def test_finish_survives_a_calendar_failure(tmp_path, capsys):
         assert auto.finish(str(wav), _dt("14:00"), _dt("14:20"), "us.zoom.xos") == 0
 
     tm.assert_called_once_with(str(wav), None, "Davide Morelli")
+
+
+def test_pick_event_ignores_reminder_calendars():
+    """'settimana Bianca' marks where Bianca is that week: never a meeting."""
+    agenda = [
+        {
+            "calendar": "settimana Bianca",
+            "start": "2026-10-26T09:00:00+00:00",
+            "end": "2026-10-26T18:00:00+00:00",
+            "summary": "Bianca a Firenze",
+        },
+        {
+            "calendar": "davide@reset.clinic",
+            "start": "2026-10-26T10:00:00+00:00",
+            "end": "2026-10-26T10:15:00+00:00",
+            "summary": "Standup",
+        },
+    ]
+    assert auto.pick_event(agenda, _dt("10:00"), _dt("10:40"))["summary"] == "Standup"
+    assert auto.pick_event(agenda, _dt("14:00"), _dt("14:30")) is None

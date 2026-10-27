@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 SELF_NAME = "Davide Morelli"
 TELEGRAM_HOOK = Path.home() / ".claude" / "hooks" / "telegram.sh"
 
+# Calendars that are reminders, never meetings: "settimana Bianca" says where
+# Bianca is that week, and its all-week events would out-overlap any real call.
+IGNORED_CALENDARS = {"settimana Bianca"}
+
 # Bundle id prefix -> what the Telegram message calls the app.
 APP_LABELS = {
     "us.zoom.": "Zoom",
@@ -53,6 +57,8 @@ def pick_event(events: list[dict], start: datetime, end: datetime) -> dict | Non
     """
     best, best_overlap = None, 0.0
     for event in events:
+        if event.get("calendar") in IGNORED_CALENDARS:
+            continue
         ev_start, ev_end = _parse(event.get("start", "")), _parse(event.get("end", ""))
         if ev_start is None or ev_end is None:
             continue

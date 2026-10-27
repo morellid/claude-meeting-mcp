@@ -85,9 +85,11 @@ struct Failure {
 final class Controller {
     // A call app must hold the mic this long before recording starts (mic tests,
     // a quick voice note in a browser), and release it this long before it stops
-    // (a dropped connection, a rejoin).
+    // (a dropped connection, a rejoin). 30 s, not 90: Meet and Zoom keep the mic
+    // open while muted, so a released mic really means the call ended, and 90 s
+    // looked like "it never stops" (2026-10-27).
     static let startAfter: TimeInterval = 8
-    static let stopAfter: TimeInterval = 90
+    static let stopAfter: TimeInterval = 30
     static let maxLength: TimeInterval = 2 * 3600
     static let minLength: TimeInterval = 60
 
@@ -126,8 +128,15 @@ final class Controller {
 
     private var lastInputUsers: [String] = []
 
+    /// Seconds until an automatic stop, once the call app has let go of the mic.
+    var stoppingIn: Int? {
+        guard let rec = recording, !rec.manual else { return nil }
+        let idle = Date().timeIntervalSince(rec.lastSeen)
+        return idle > 4 ? max(0, Int(Controller.stopAfter - idle)) : nil
+    }
+
     func tick() {
-        let users = MicWatcher.inputUsers()
+        let users = MicWatcher.inputUsers().filter { !$0.isEmpty }  // audiocap has no bundle id
         if users != lastInputUsers {
             log("mic users: \(users.isEmpty ? "none" : users.joined(separator: ", "))")
             lastInputUsers = users

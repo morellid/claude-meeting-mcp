@@ -6,7 +6,7 @@ import UserNotifications
 //
 // A call is on when a conferencing app (Zoom, Meet in a browser, Teams, Slack)
 // holds the microphone. The app then runs audiocap until the mic has been free
-// for 90 s, and hands the WAV to `meeting-auto finish` (Python), which names it
+// for 30 s, and hands the WAV to `meeting-auto finish` (Python), which names it
 // from the calendar, transcribes it with Mistral and leaves it for the agent
 // router to file. The menu bar icon shows the state; errors offer a retry.
 // =============================================================================
@@ -122,6 +122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         if let rec = controller.recording {
             let minutes = Int(Date().timeIntervalSince(rec.start) / 60)
             info("Recording \(Controller.describe(rec.app)) - \(minutes) min")
+            if let seconds = controller.stoppingIn {
+                info("Call ended - stopping in \(seconds) s")
+            }
             if let since = controller.silentSince {
                 info("Silent since \(DateFormatter.localizedString(from: since, dateStyle: .none, timeStyle: .short))")
             }
