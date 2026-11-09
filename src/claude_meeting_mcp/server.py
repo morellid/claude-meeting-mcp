@@ -14,7 +14,7 @@ from typing import Annotated
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
-from . import jobs
+from . import jobs, live
 from .capture import get_capturer
 from .config import get_config, update_config, validate_config
 from .pv_generator import generate_pv, save_pv
@@ -58,6 +58,10 @@ Prefer audio_stop_and_transcribe over separate stop + transcribe.
 transcribes in the background; poll audio_transcribe_status(meeting_id) for the
 result so the user can write notes meanwhile. audio_transcribe (existing file on
 disk) is background too - same polling.
+
+DURING A CALL: "what did they say about X?", "check the transcript" →
+audio_live_transcript(). Every recording (auto or manual) keeps a rough live
+transcript; re-read it on each question, it grows while the call goes on.
 """,
 )
 
@@ -405,6 +409,31 @@ def audio_live_status() -> dict:
             "error": "No live translation active. Use audio_record_start(live_translate='en')",
         }
     return status
+
+
+@mcp.tool()
+def audio_live_transcript(
+    meeting_id: Annotated[
+        str | None,
+        Field(description="Recording id (WAV name without .wav). Default: the latest recording."),
+    ] = None,
+    last_minutes: Annotated[
+        float | None,
+        Field(description="Only the last N minutes of the transcript. Default: all of it."),
+    ] = None,
+) -> dict:
+    """Use this DURING a call to read what has been said so far.
+
+    Every recording, started by AutoRecorder or by audio_record_start, keeps a rough
+    live transcript (small local model, about 10-20 s behind). It reads a file and
+    loads no model, so call it again for every question: it grows during the call.
+    'Davide' is the microphone, 'Remote' everyone else. lag_seconds says how far it
+    trails the recording; recording_active is False once the call has ended.
+    For the meeting record use the final transcript, not this.
+    """
+    if meeting_id and not _SAFE_ID_RE.match(meeting_id):
+        return {"error": "Invalid meeting_id"}
+    return live.read_live(meeting_id, last_minutes)
 
 
 @mcp.tool()

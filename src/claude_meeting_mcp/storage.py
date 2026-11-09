@@ -110,7 +110,7 @@ def cleanup_old_files() -> list[str]:
 
     # Live translation: 24 hours
     live_cutoff = datetime.now() - timedelta(hours=24)
-    for f in TRANSCRIPTIONS_DIR.glob("*_live.md"):
+    for f in [*TRANSCRIPTIONS_DIR.glob("*_live.md"), *TRANSCRIPTIONS_DIR.glob("*_live.jsonl")]:
         if datetime.fromtimestamp(f.stat().st_mtime) < live_cutoff:
             f.unlink()
             removed.append(f"transcriptions/{f.name}")

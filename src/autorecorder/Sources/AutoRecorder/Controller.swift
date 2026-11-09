@@ -68,6 +68,8 @@ struct Recording {
     let start: Date
     let app: String
     let process: Process
+    /// The live transcript worker (live.py); nil if it could not start.
+    let live: Process?
     let manual: Bool
     var lastSeen: Date
 }
@@ -205,7 +207,7 @@ final class Controller {
             return
         }
         recording = Recording(file: file, start: Date(), app: app, process: process,
-                              manual: manual, lastSeen: Date())
+                              live: startLive(file), manual: manual, lastSeen: Date())
         log("recording started (\(manual ? "manual" : app)): \(file.lastPathComponent)")
         onEvent("Recording started", Controller.describe(app))
         onChange()
@@ -227,6 +229,7 @@ final class Controller {
         }
         DispatchQueue.global().async { [self] in
             current.process.waitUntilExit()
+            Controller.stopLive(current)
             DispatchQueue.main.async { [self] in
                 guard stopping?.recording.file == current.file else { return }  // quit got it
                 stopping = nil
@@ -243,6 +246,7 @@ final class Controller {
         if let (current, end) = stopping {
             stopping = nil
             current.process.waitUntilExit()
+            Controller.stopLive(current)
             lock.release()
             finishRecording(current, end: end)
         }
@@ -250,6 +254,7 @@ final class Controller {
         recording = nil
         current.process.interrupt()
         current.process.waitUntilExit()
+        Controller.stopLive(current)
         lock.release()
         finishRecording(current, end: Date())
     }
@@ -297,6 +302,7 @@ final class Controller {
 
     private func captureDied(_ current: Recording) {
         recording = nil
+        Controller.stopLive(current)
         lock.release()
         suppressUntilMicFree = true
         let end = Date()
@@ -371,6 +377,32 @@ final class Controller {
             mistralProblem = problem
             onChange()
         }
+    }
+
+    /// Starts the live transcript worker on the WAV audiocap is writing. Failing to
+    /// start it costs only the live transcript, never the recording.
+    private func startLive(_ file: URL) -> Process? {
+        let process = Process()
+        // The venv's python, not `uv run`: SIGTERM must reach the worker itself.
+        process.executableURL = Paths.repo.appendingPathComponent(".venv/bin/python")
+        process.arguments = ["-m", "claude_meeting_mcp.live", file.path]
+        process.standardOutput = logHandle()
+        process.standardError = logHandle()
+        do {
+            try process.run()
+            return process
+        } catch {
+            log("live transcript not started: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Stops the live worker and waits for it: the final transcription must not
+    /// start while the live model is still in memory.
+    static func stopLive(_ recording: Recording) {
+        guard let live = recording.live, live.isRunning else { return }
+        live.terminate()
+        live.waitUntilExit()
     }
 
     /// Runs `meeting-auto <args>` from the repo and hands its last stdout line, parsed.

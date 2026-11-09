@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Callable
 
+from . import live
 from .capture import get_capturer
 from .config import RecordingConfig, get_config
 from .storage import (
@@ -62,6 +63,7 @@ _session: int = 0  # bumped on every start; identifies which recording a timer b
 _started_at: float | None = None
 _timeout_timer: threading.Timer | None = None
 _live_translator = None
+_live_worker = None  # the live transcript process (live.py) for the current recording
 _auto_stop_handler: Callable[[str], None] | None = None
 
 
@@ -120,6 +122,7 @@ def start_recording(live_translate: str | None = None, mcp_context=None, event_l
         event_loop: Main asyncio event loop (for thread-safe MCP calls).
     """
     global _capturer, _current_file, _session, _started_at, _timeout_timer, _live_translator
+    global _live_worker
 
     with _lock:
         if _capturer is not None:
@@ -167,6 +170,11 @@ def start_recording(live_translate: str | None = None, mcp_context=None, event_l
 
         result = {"status": "recording", "file": _current_file, "max_seconds": max_seconds}
 
+        try:
+            _live_worker = live.spawn(_current_file)
+        except OSError as e:  # the recording matters more than the live transcript
+            logger.error("Live transcript not started: %s", e)
+
         # Start live translation if requested
         if live_translate:
             try:
@@ -205,6 +213,7 @@ def start_recording(live_translate: str | None = None, mcp_context=None, event_l
 def stop_recording() -> dict:
     """Stop current recording."""
     global _capturer, _current_file, _started_at, _timeout_timer, _live_translator
+    global _live_worker
 
     with _lock:
         if _capturer is None:
@@ -222,6 +231,11 @@ def stop_recording() -> dict:
             except Exception as e:
                 logger.error("Error stopping live translator: %s", e)
             _live_translator = None
+
+        # Before the capture stops: the final transcription starts as soon as this
+        # returns, and the live model must be out of memory by then.
+        live.stop(_live_worker)
+        _live_worker = None
 
         file_path = _current_file
         _started_at = None
