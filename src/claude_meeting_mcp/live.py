@@ -34,7 +34,8 @@ from .transcriber import _channel_is_silent, _resample_to_16k
 
 logger = logging.getLogger(__name__)
 
-# small: ~0.07x real time per channel on an M4 and ~500 MB resident, so it keeps
+# small: ~0.07x real time per channel on an M4 and ~1.1 GB footprint (model plus
+# the 512 MB MLX cache cap, measured with footprint 2026-11-09), so it keeps
 # up with two channels and leaves memory for the call app (measured 2026-11-09).
 LIVE_MODEL = "small"
 CHUNK_SECONDS = 10.0
@@ -112,6 +113,7 @@ class LiveTranscriber:
         self._buf = np.zeros((0, 2), dtype=np.float32)
         self._pos = 0  # samples already transcribed, from the start of the recording
         self._ppid = os.getppid()
+        self._seen = False  # the WAV has existed: from now on, missing means deleted
 
     def step(self) -> bool:
         """Transcribe one chunk if a full one is buffered. False when waiting for audio."""
@@ -119,6 +121,7 @@ class LiveTranscriber:
             frames = self._source.get_new_frames()
             if frames is None:
                 return False
+            self._seen = True
             self._buf = np.concatenate([self._buf, frames])
 
         sr = self._source.get_sample_rate()
@@ -146,7 +149,10 @@ class LiveTranscriber:
         return True
 
     def run(self, stop: threading.Event) -> None:
-        started, seen = time.time(), False
+        # Create the file at once: with two calls back to back, the newest live
+        # file must be the new meeting's from its first second, not the old one's.
+        self._out.touch()
+        started = time.time()
         while not stop.is_set():
             if os.getppid() != self._ppid:
                 logger.warning("Parent process gone, exiting")
@@ -155,11 +161,11 @@ class LiveTranscriber:
                 continue
             try:
                 idle = time.time() - Path(self._wav).stat().st_mtime
-                seen = True
+                self._seen = True
             except OSError:
                 # Before audiocap has created the file, wait for it; once seen, a
                 # missing WAV means the recording was discarded or transcribed.
-                if seen or time.time() - started > ORPHAN_SECONDS:
+                if self._seen or time.time() - started > ORPHAN_SECONDS:
                     return
                 stop.wait(1.0)
                 continue
@@ -181,20 +187,27 @@ def read_live(
     transcripts_dir: Path = TRANSCRIPTIONS_DIR,
     recordings_dir: Path = RECORDINGS_DIR,
 ) -> dict:
-    """The live transcript of `meeting_id`, or of the most recent recording."""
-    if meeting_id:
-        path = transcripts_dir / f"{meeting_id}_live.jsonl"
-        files = [path] if path.exists() else []
-    else:
-        files = sorted(transcripts_dir.glob("*_live.jsonl"), key=lambda p: p.stat().st_mtime)
-    if not files:
-        return {"error": "No live transcript: it exists only during a recording (and a day after)."}
-    path = files[-1]
+    """The live transcript of `meeting_id`, or of the most recent recording.
+
+    Both files can be deleted under us at any moment (the final transcription
+    deletes the WAV, the 24 h cleanup the live file), so every read tolerates it.
+    """
+    missing = {"error": "No live transcript: it exists only during a recording (and a day after)."}
+    try:
+        if meeting_id:
+            path = transcripts_dir / f"{meeting_id}_live.jsonl"
+            files = [path] if path.exists() else []
+        else:
+            files = sorted(transcripts_dir.glob("*_live.jsonl"), key=lambda p: p.stat().st_mtime)
+        if not files:
+            return missing
+        path = files[-1]
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return missing
     meeting_id = path.name.removesuffix("_live.jsonl")
 
-    rows = [
-        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-    ]
+    rows = [json.loads(line) for line in text.splitlines() if line.strip()]
     rows.sort(key=lambda r: r["start"])
     transcribed_until = max((r["end"] for r in rows), default=0.0)
     if last_minutes is not None:
@@ -211,14 +224,16 @@ def read_live(
         "'Davide' is the mic, 'Remote' everyone else in the call.",
     }
     wav = recordings_dir / f"{meeting_id}.wav"
-    if wav.exists():
+    try:
         stat = wav.stat()
-        header = FileAudioSource(str(wav))
-        data_start = header._find_data_offset() or WAV_HEADER_BYTES
-        recorded = (stat.st_size - data_start) / (header.get_sample_rate() * 4)
-        result["recording_active"] = time.time() - stat.st_mtime < 10
-        result["recorded_seconds"] = round(recorded)
-        result["lag_seconds"] = round(max(0.0, recorded - transcribed_until))
+    except OSError:
+        return result  # no WAV: the recording is over and was transcribed (or discarded)
+    header = FileAudioSource(str(wav))
+    data_start = header._find_data_offset() or WAV_HEADER_BYTES  # None if it vanished: fine
+    recorded = (stat.st_size - data_start) / (header.get_sample_rate() * 4)
+    result["recording_active"] = time.time() - stat.st_mtime < 10
+    result["recorded_seconds"] = round(recorded)
+    result["lag_seconds"] = round(max(0.0, recorded - transcribed_until))
     return result
 
 

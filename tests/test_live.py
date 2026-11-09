@@ -209,3 +209,107 @@ def test_worker_exits_when_its_parent_dies(tmp_path, monkeypatch):
     thread.start()
     thread.join(timeout=3)
     assert not thread.is_alive()
+
+
+def test_worker_survives_the_wav_being_deleted_under_it(tmp_path):
+    # The final transcription deletes the WAV when done; the worker must stop
+    # reading without raising, and its run loop must end.
+    import threading
+
+    wav = tmp_path / "d_call.wav"
+    _write_stereo(wav, _tone(12.0), _tone(12.0))
+    worker = live.LiveTranscriber(
+        str(wav), tmp_path / "d.jsonl", transcribe=lambda a: [], sample_rate=SR
+    )
+    assert worker.step() is True
+    wav.unlink()
+    assert worker.step() is False
+    thread = threading.Thread(target=worker.run, args=(threading.Event(),), daemon=True)
+    thread.start()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+
+
+def test_read_live_when_the_wav_vanishes_between_checks(tmp_path, monkeypatch):
+    # Race: the batch deletes the WAV after read_live saw it exist but before it
+    # read its size. The tool must answer, reporting the recording as over.
+
+    (tmp_path / "v_call_live.jsonl").write_text(
+        json.dumps({"start": 1.0, "end": 2.0, "speaker": "Remote", "text": "ciao"}) + "\n"
+    )
+    real_exists = Path.exists
+    monkeypatch.setattr(
+        Path, "exists", lambda self: True if self.suffix == ".wav" else real_exists(self)
+    )
+    result = live.read_live(transcripts_dir=tmp_path, recordings_dir=tmp_path)
+    assert result["transcript"] == "[00:01] Remote: ciao"
+    assert result["recording_active"] is False
+
+
+def test_read_live_when_the_live_file_vanishes_while_listed(tmp_path, monkeypatch):
+    # The 24 h cleanup may delete the live file between listing and reading it.
+
+    real_exists = Path.exists
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda self: True if self.name.endswith("_live.jsonl") else real_exists(self),
+    )
+    result = live.read_live("gone_call", transcripts_dir=tmp_path, recordings_dir=tmp_path)
+    assert "error" in result
+
+
+def test_back_to_back_the_new_meeting_wins_from_its_first_second(tmp_path):
+    # Meeting A just ended (its live file has text), meeting B started a few
+    # seconds later: before B's first chunk, a question must get B, not A.
+    import os
+    import threading
+    import time
+
+    a = tmp_path / "a_call_live.jsonl"
+    a.write_text(
+        json.dumps({"start": 1.0, "end": 2.0, "speaker": "Remote", "text": "meeting A"}) + "\n"
+    )
+    os.utime(a, (time.time() - 30, time.time() - 30))
+    b_wav = tmp_path / "b_call.wav"
+    b = live.LiveTranscriber(
+        str(b_wav), tmp_path / "b_call_live.jsonl", transcribe=lambda x: [], sample_rate=SR
+    )
+    done = threading.Event()
+    thread = threading.Thread(target=b.run, args=(done,), daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    result = live.read_live(transcripts_dir=tmp_path, recordings_dir=tmp_path)
+    done.set()
+    thread.join(timeout=3)
+    assert result["meeting_id"] == "b_call"
+    assert result["transcript"] == ""
+
+
+@patch("claude_meeting_mcp.recorder.get_capturer")
+@patch("claude_meeting_mcp.recorder._capturer", None)
+@patch("claude_meeting_mcp.recorder._current_file", None)
+def test_recorder_back_to_back_stops_a_before_starting_b(mock_get):
+    import claude_meeting_mcp.recorder as rec
+
+    capturer = MagicMock()
+    capturer.is_available.return_value = True
+    mock_get.return_value = capturer
+    events: list[str] = []
+    procs = {}
+
+    def fake_spawn(wav):
+        name = "A" if not procs else "B"
+        proc = MagicMock()
+        proc.wait.side_effect = lambda timeout=None: events.append(f"{name} exited")
+        procs[name] = proc
+        events.append(f"{name} started")
+        return proc
+
+    with patch.object(live, "spawn", side_effect=fake_spawn):
+        rec.start_recording()
+        rec.stop_recording()
+        rec.start_recording()
+        rec.stop_recording()
+
+    assert events == ["A started", "A exited", "B started", "B exited"]
