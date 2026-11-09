@@ -43,12 +43,14 @@ def test_worker_labels_channels_and_offsets_segments(tmp_path):
 
     calls: list[float] = []
 
-    def fake_transcribe(audio: np.ndarray) -> list[dict]:
+    def fake_transcribe(audio: np.ndarray, language: str | None) -> tuple[list[dict], str]:
         calls.append(len(audio) / 16000)
-        return [{"start": 2.0, "end": 3.0, "text": "ciao"}]
+        return [{"start": 2.0, "end": 3.0, "text": "ciao"}], "it"
 
     out = tmp_path / "live.jsonl"
-    worker = live.LiveTranscriber(str(wav), out, transcribe=fake_transcribe, sample_rate=SR)
+    worker = live.LiveTranscriber(
+        str(wav), out, transcribe=fake_transcribe, sample_rate=SR, language="it"
+    )
     assert worker.step() is True  # chunk 1: 0 .. ~9.0 s
     assert worker.step() is True  # chunk 2: ~9.0 .. ~19 s
     lines = [json.loads(x) for x in out.read_text().splitlines()]
@@ -63,7 +65,7 @@ def test_worker_waits_for_a_full_chunk(tmp_path):
     wav = tmp_path / "short_call.wav"
     _write_stereo(wav, _tone(4.0), _tone(4.0))
     worker = live.LiveTranscriber(
-        str(wav), tmp_path / "o.jsonl", transcribe=lambda a: [], sample_rate=SR
+        str(wav), tmp_path / "o.jsonl", transcribe=lambda a, lang: ([], None), sample_rate=SR
     )
     assert worker.step() is False
 
@@ -150,8 +152,9 @@ def test_worker_waits_for_audiocap_to_create_the_wav(tmp_path):
     worker = live.LiveTranscriber(
         str(wav),
         out,
-        transcribe=lambda a: [{"start": 0.0, "end": 1.0, "text": "x"}],
+        transcribe=lambda a, lang: ([{"start": 0.0, "end": 1.0, "text": "x"}], "en"),
         sample_rate=SR,
+        language="en",
     )
     done = threading.Event()
     thread = threading.Thread(target=worker.run, args=(done,), daemon=True)
@@ -178,12 +181,13 @@ def test_worker_and_reader_use_the_rate_in_the_wav_header(tmp_path):
 
     lengths: list[float] = []
 
-    def fake(audio: np.ndarray) -> list[dict]:
+    def fake(audio: np.ndarray, language: str | None) -> tuple[list[dict], str]:
         lengths.append(len(audio) / 16000)
-        return [{"start": 2.0, "end": 3.0, "text": "x"}]
+        return [{"start": 2.0, "end": 3.0, "text": "x"}], "en"
 
     out = tmp_path / "m2_call_live.jsonl"
-    worker = live.LiveTranscriber(str(wav), out, transcribe=fake)  # default rate is 48 kHz
+    # default rate is 48 kHz
+    worker = live.LiveTranscriber(str(wav), out, transcribe=fake, language="en")
     assert worker.step() and worker.step()
     assert 9.0 <= lengths[0] <= 9.2  # the first chunk ends at the pause, in real seconds
     starts = [json.loads(x)["start"] for x in out.read_text().splitlines()]
@@ -202,7 +206,7 @@ def test_worker_exits_when_its_parent_dies(tmp_path, monkeypatch):
     wav = tmp_path / "o_call.wav"
     _write_stereo(wav, _tone(2.0), _tone(2.0))
     worker = live.LiveTranscriber(
-        str(wav), tmp_path / "o.jsonl", transcribe=lambda a: [], sample_rate=SR
+        str(wav), tmp_path / "o.jsonl", transcribe=lambda a, lang: ([], None), sample_rate=SR
     )
     monkeypatch.setattr(os, "getppid", lambda: 1)
     thread = threading.Thread(target=worker.run, args=(threading.Event(),), daemon=True)
@@ -219,7 +223,11 @@ def test_worker_survives_the_wav_being_deleted_under_it(tmp_path):
     wav = tmp_path / "d_call.wav"
     _write_stereo(wav, _tone(12.0), _tone(12.0))
     worker = live.LiveTranscriber(
-        str(wav), tmp_path / "d.jsonl", transcribe=lambda a: [], sample_rate=SR
+        str(wav),
+        tmp_path / "d.jsonl",
+        transcribe=lambda a, lang: ([], None),
+        sample_rate=SR,
+        language="en",
     )
     assert worker.step() is True
     wav.unlink()
@@ -273,7 +281,10 @@ def test_back_to_back_the_new_meeting_wins_from_its_first_second(tmp_path):
     os.utime(a, (time.time() - 30, time.time() - 30))
     b_wav = tmp_path / "b_call.wav"
     b = live.LiveTranscriber(
-        str(b_wav), tmp_path / "b_call_live.jsonl", transcribe=lambda x: [], sample_rate=SR
+        str(b_wav),
+        tmp_path / "b_call_live.jsonl",
+        transcribe=lambda x, lang: ([], None),
+        sample_rate=SR,
     )
     done = threading.Event()
     thread = threading.Thread(target=b.run, args=(done,), daemon=True)
@@ -331,7 +342,75 @@ def test_whisper_small_never_retries_and_honours_the_language(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "mlx_whisper", types.SimpleNamespace(transcribe=fake_transcribe)
     )
-    rows = live.whisper_small(np.zeros(16000, np.float32), language="en")
+    rows, language = live.whisper_small(np.zeros(16000, np.float32), language="en")
     assert rows == [{"start": 0.0, "end": 1.0, "text": "hi"}]
+    assert language == "en"
     assert seen["temperature"] == 0.0
     assert seen["language"] == "en"
+
+
+def test_whisper_small_reports_the_language_it_detected(monkeypatch):
+    import sys
+    import types
+
+    def fake_transcribe(audio, **kw):
+        return {"language": "it", "segments": []}
+
+    monkeypatch.setitem(
+        sys.modules, "mlx_whisper", types.SimpleNamespace(transcribe=fake_transcribe)
+    )
+    assert live.whisper_small(np.zeros(16000, np.float32)) == ([], "it")
+
+
+def _recording_fake(calls: list, detected: str):
+    def fake(audio: np.ndarray, language: str | None) -> tuple[list[dict], str]:
+        calls.append((round(len(audio) / 16000), language))
+        return [{"start": 0.0, "end": 1.0, "text": "x"}], language or detected
+
+    return fake
+
+
+def test_worker_detects_the_language_on_30_s_then_locks_it(tmp_path):
+    # Detection on a 10 s chunk of call audio picked Welsh (2026-11-09). The first
+    # chunk is 30 s, the window Whisper detects on; its language holds for the call.
+    wav = tmp_path / "lang_call.wav"
+    _write_stereo(wav, _tone(50.0), _tone(50.0))
+    calls: list = []
+    worker = live.LiveTranscriber(
+        str(wav), tmp_path / "l.jsonl", transcribe=_recording_fake(calls, "it"), sample_rate=SR
+    )
+    assert worker.step() and worker.step()
+    first, *rest = calls
+    assert 28 <= first[0] <= 30 and first[1] is None  # Remote, chunk 1: detect
+    assert rest[0][1] == "it"  # mic, same chunk: already locked
+    assert rest[1][0] <= 10 and all(lang == "it" for _, lang in rest)  # 10 s chunks after
+
+
+def test_worker_with_a_given_language_never_detects(tmp_path):
+    wav = tmp_path / "en_call.wav"
+    _write_stereo(wav, _tone(25.0), np.zeros(int(25.0 * SR), np.float32))
+    calls: list = []
+    worker = live.LiveTranscriber(
+        str(wav),
+        tmp_path / "e.jsonl",
+        transcribe=_recording_fake(calls, "it"),
+        sample_rate=SR,
+        language="en",
+    )
+    assert worker.step()
+    assert calls[0][0] <= 10 and calls[0][1] == "en"
+
+
+def test_a_silent_start_does_not_lock_a_language(tmp_path):
+    # Calls often open with silence (waiting room): nothing to detect on, so the
+    # worker keeps detecting until someone speaks.
+    left = np.concatenate([np.zeros(int(31.0 * SR), np.float32), _tone(40.0)])
+    wav = tmp_path / "quiet_call.wav"
+    _write_stereo(wav, left, np.zeros_like(left))
+    calls: list = []
+    worker = live.LiveTranscriber(
+        str(wav), tmp_path / "q.jsonl", transcribe=_recording_fake(calls, "en"), sample_rate=SR
+    )
+    assert worker.step() and calls == []  # silent 30 s: no model call
+    assert worker.step()
+    assert calls[0][1] is None and 28 <= calls[0][0] <= 30

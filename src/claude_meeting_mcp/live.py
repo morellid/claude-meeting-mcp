@@ -15,7 +15,6 @@ meeting record still come from the final transcription.
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import logging
 import os
@@ -40,6 +39,9 @@ logger = logging.getLogger(__name__)
 # up with two channels and leaves memory for the call app (measured 2026-11-09).
 LIVE_MODEL = "small"
 CHUNK_SECONDS = 10.0
+# Until the language is known, chunks are 30 s: Whisper detects the language on a
+# 30 s window, and on 10 s of call audio it picked Welsh and Russian (2026-11-09).
+DETECT_SECONDS = 30.0
 # audiocap writes system audio (the others) left and the mic (Davide) right.
 SPEAKERS = ("Remote", "Davide")
 # The worker exits on its own when the WAV stops growing this long: its parent
@@ -47,7 +49,8 @@ SPEAKERS = ("Remote", "Davide")
 ORPHAN_SECONDS = 120.0
 WAV_HEADER_BYTES = 44
 
-Transcribe = Callable[[np.ndarray], list[dict]]
+# (16 kHz mono audio, language or None to detect) -> (segments, language used)
+Transcribe = Callable[[np.ndarray, str | None], tuple[list[dict], str | None]]
 
 
 def live_path(wav_path: str, transcripts_dir: Path = TRANSCRIPTIONS_DIR) -> Path:
@@ -68,13 +71,13 @@ def cut_point(audio: np.ndarray, sr: int, search_seconds: float = 2.0) -> int:
     return start + int(np.argmin(energy)) * frame + frame // 2
 
 
-def whisper_small(audio: np.ndarray, language: str | None = None) -> list[dict]:
+def whisper_small(audio: np.ndarray, language: str | None = None) -> tuple[list[dict], str | None]:
     """Transcribe 16 kHz mono audio with the small MLX Whisper.
 
     One greedy pass (temperature 0, no fallback): on real call audio the fallback
     re-decoded hallucination loops until a 10 s chunk took longer than 10 s and the
-    worker fell behind the call (2026-11-09). `language` None = detect per chunk,
-    which on short noisy chunks can pick the wrong language.
+    worker fell behind the call (2026-11-09). `language` None = detect it on the
+    first 30 s of the audio. Returns the segments and the language used.
     """
     import mlx_whisper
 
@@ -92,11 +95,12 @@ def whisper_small(audio: np.ndarray, language: str | None = None) -> list[dict]:
         )
     finally:
         _mlx.clear_cache()
-    return [
+    segments = [
         {"start": s["start"], "end": s["end"], "text": s["text"].strip()}
         for s in result.get("segments", [])
         if s["text"].strip()
     ]
+    return segments, result.get("language", language)
 
 
 class LiveTranscriber:
@@ -109,11 +113,14 @@ class LiveTranscriber:
         transcribe: Transcribe = whisper_small,
         sample_rate: int = 48000,
         chunk_seconds: float = CHUNK_SECONDS,
+        language: str | None = None,
     ) -> None:
         self._wav = wav_path
         self._out = out_path
         self._transcribe = transcribe
         self._chunk_seconds = chunk_seconds
+        # None until detected on the first chunk with speech, then fixed for the call.
+        self._language = language
         # sample_rate is only a fallback: the source switches to the header's rate.
         self._source = FileAudioSource(wav_path, sample_rate=sample_rate, channels=2)
         self._buf = np.zeros((0, 2), dtype=np.float32)
@@ -123,7 +130,8 @@ class LiveTranscriber:
 
     def step(self) -> bool:
         """Transcribe one chunk if a full one is buffered. False when waiting for audio."""
-        while len(self._buf) < self._chunk_seconds * self._source.get_sample_rate():
+        seconds = self._chunk_seconds if self._language else DETECT_SECONDS
+        while len(self._buf) < seconds * self._source.get_sample_rate():
             frames = self._source.get_new_frames()
             if frames is None:
                 return False
@@ -131,7 +139,7 @@ class LiveTranscriber:
             self._buf = np.concatenate([self._buf, frames])
 
         sr = self._source.get_sample_rate()
-        cut = cut_point(self._buf[: int(self._chunk_seconds * sr)].mean(axis=1), sr)
+        cut = cut_point(self._buf[: int(seconds * sr)].mean(axis=1), sr)
         chunk, self._buf = self._buf[:cut], self._buf[cut:]
         offset = self._pos / sr
         self._pos += cut
@@ -141,7 +149,11 @@ class LiveTranscriber:
             audio = chunk[:, channel]
             if _channel_is_silent(audio):
                 continue
-            for seg in self._transcribe(_resample_to_16k(audio, sr)):
+            segments, language = self._transcribe(_resample_to_16k(audio, sr), self._language)
+            if self._language is None and language:
+                self._language = language
+                logger.info("Language detected: %s, kept for the rest of the call", language)
+            for seg in segments:
                 rows.append(
                     {
                         "start": round(offset + seg["start"], 2),
@@ -227,7 +239,9 @@ def read_live(
         "transcribed_until_seconds": round(transcribed_until),
         "recording_active": False,
         "note": "Rough live transcript (small local model): names and numbers may be wrong. "
-        "'Davide' is the mic, 'Remote' everyone else in the call.",
+        "'Remote' is the call audio, 'Davide' the mic. The mic also picks up people "
+        "in the room with Davide, and without headphones it echoes Remote lines: "
+        "a 'Davide' line that repeats a 'Remote' one a few seconds apart is echo.",
     }
     wav = recordings_dir / f"{meeting_id}.wav"
     try:
@@ -267,7 +281,9 @@ def stop(proc: subprocess.Popen | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live transcript of a recording in progress")
     parser.add_argument("wav", help="The WAV audiocap is writing")
-    parser.add_argument("--language", help="Language of the call (e.g. en, it). Default: detect")
+    parser.add_argument(
+        "--language", help="Language of the call (e.g. en, it). Default: detect on the first 30 s"
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="meeting-live: %(message)s")
     logging.getLogger("claude_meeting_mcp.transcriber").setLevel(logging.WARNING)  # per-chunk noise
@@ -278,8 +294,7 @@ def main() -> None:
     out = live_path(args.wav)
     out.parent.mkdir(parents=True, exist_ok=True)
     logger.info("%s -> %s", args.wav, out)
-    transcribe = functools.partial(whisper_small, language=args.language)
-    LiveTranscriber(args.wav, out, transcribe=transcribe).run(threading.Event())
+    LiveTranscriber(args.wav, out, language=args.language).run(threading.Event())
 
 
 if __name__ == "__main__":
