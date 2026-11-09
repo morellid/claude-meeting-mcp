@@ -15,6 +15,7 @@ meeting record still come from the final transcription.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import get_config, get_mlx_model_id
+from .config import get_mlx_model_id
 from .live_translator import FileAudioSource
 from .storage import RECORDINGS_DIR, TRANSCRIPTIONS_DIR
 from .transcriber import _channel_is_silent, _resample_to_16k
@@ -67,8 +68,14 @@ def cut_point(audio: np.ndarray, sr: int, search_seconds: float = 2.0) -> int:
     return start + int(np.argmin(energy)) * frame + frame // 2
 
 
-def whisper_small(audio: np.ndarray) -> list[dict]:
-    """Transcribe 16 kHz mono audio with the small MLX Whisper."""
+def whisper_small(audio: np.ndarray, language: str | None = None) -> list[dict]:
+    """Transcribe 16 kHz mono audio with the small MLX Whisper.
+
+    One greedy pass (temperature 0, no fallback): on real call audio the fallback
+    re-decoded hallucination loops until a 10 s chunk took longer than 10 s and the
+    worker fell behind the call (2026-11-09). `language` None = detect per chunk,
+    which on short noisy chunks can pick the wrong language.
+    """
     import mlx_whisper
 
     from . import _mlx
@@ -78,9 +85,8 @@ def whisper_small(audio: np.ndarray) -> list[dict]:
         result = mlx_whisper.transcribe(
             audio.astype(np.float32, copy=False),
             path_or_hf_repo=get_mlx_model_id(LIVE_MODEL),
-            language=None
-            if get_config().transcription.language == "auto"
-            else get_config().transcription.language,
+            language=language,
+            temperature=0.0,
             condition_on_previous_text=False,
             hallucination_silence_threshold=1.0,
         )
@@ -261,6 +267,7 @@ def stop(proc: subprocess.Popen | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live transcript of a recording in progress")
     parser.add_argument("wav", help="The WAV audiocap is writing")
+    parser.add_argument("--language", help="Language of the call (e.g. en, it). Default: detect")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="meeting-live: %(message)s")
     logging.getLogger("claude_meeting_mcp.transcriber").setLevel(logging.WARNING)  # per-chunk noise
@@ -271,7 +278,8 @@ def main() -> None:
     out = live_path(args.wav)
     out.parent.mkdir(parents=True, exist_ok=True)
     logger.info("%s -> %s", args.wav, out)
-    LiveTranscriber(args.wav, out).run(threading.Event())
+    transcribe = functools.partial(whisper_small, language=args.language)
+    LiveTranscriber(args.wav, out, transcribe=transcribe).run(threading.Event())
 
 
 if __name__ == "__main__":

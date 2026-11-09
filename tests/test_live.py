@@ -313,3 +313,25 @@ def test_recorder_back_to_back_stops_a_before_starting_b(mock_get):
         rec.stop_recording()
 
     assert events == ["A started", "A exited", "B started", "B exited"]
+
+
+def test_whisper_small_never_retries_and_honours_the_language(monkeypatch):
+    # On real call audio, temperature fallback retried hallucination loops until a
+    # 10 s chunk took longer than 10 s, and auto-detect picked Welsh: the live model
+    # must decode once, in the language it is given.
+    import sys
+    import types
+
+    seen: dict = {}
+
+    def fake_transcribe(audio, **kw):
+        seen.update(kw)
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": " hi "}]}
+
+    monkeypatch.setitem(
+        sys.modules, "mlx_whisper", types.SimpleNamespace(transcribe=fake_transcribe)
+    )
+    rows = live.whisper_small(np.zeros(16000, np.float32), language="en")
+    assert rows == [{"start": 0.0, "end": 1.0, "text": "hi"}]
+    assert seen["temperature"] == 0.0
+    assert seen["language"] == "en"
