@@ -73,11 +73,26 @@ class FileAudioSource:
                     chunk_size = struct.unpack("<I", chunk_header[4:8])[0]
                     if chunk_id == b"data":
                         return f.tell()
+                    if chunk_id == b"fmt ":
+                        # audiocap writes at the output device's rate (not always
+                        # 48 kHz): trust the header over the constructor's guess.
+                        fmt = f.read(chunk_size)
+                        self._channels, self._sample_rate = struct.unpack("<HI", fmt[2:8])
+                        self._frame_size = self._channels * self._bytes_per_sample
+                        continue
                     f.seek(chunk_size, 1)  # skip chunk
         except (OSError, struct.error):
             return None
 
     def get_new_audio(self) -> np.ndarray | None:
+        """New samples of the left channel (system audio) since the last call."""
+        frames = self.get_new_frames()
+        if frames is None or frames.ndim == 1:
+            return frames
+        return frames[:, 0]
+
+    def get_new_frames(self) -> np.ndarray | None:
+        """New PCM since the last call: (frames, channels) for stereo, 1-D for mono."""
         if not os.path.exists(self._path):
             return None
 
@@ -108,9 +123,8 @@ class FileAudioSource:
 
             # Decode 16-bit PCM to float32
             samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            # Reshape to (frames, channels) and take left channel (system audio)
             if self._channels > 1:
-                samples = samples.reshape(-1, self._channels)[:, 0]
+                samples = samples.reshape(-1, self._channels)
 
             return samples
 
