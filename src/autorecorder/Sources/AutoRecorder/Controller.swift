@@ -379,6 +379,13 @@ final class Controller {
         }
     }
 
+    /// launchd gives the app a bare PATH; children need Homebrew's (gws) and ~/.local/bin.
+    static let childEnvironment: [String: String] = {
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:\(Paths.home.path)/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        return env
+    }()
+
     /// Starts the live transcript worker on the WAV audiocap is writing. Failing to
     /// start it costs only the live transcript, never the recording.
     private func startLive(_ file: URL) -> Process? {
@@ -386,6 +393,7 @@ final class Controller {
         // The venv's python, not `uv run`: SIGTERM must reach the worker itself.
         process.executableURL = Paths.repo.appendingPathComponent(".venv/bin/python")
         process.arguments = ["-m", "claude_meeting_mcp.live", file.path]
+        process.environment = Self.childEnvironment  // gws, for the calendar language hint
         process.standardOutput = logHandle()
         process.standardError = logHandle()
         do {
@@ -410,9 +418,7 @@ final class Controller {
         let process = Process()
         process.executableURL = Paths.uv
         process.arguments = ["--directory", Paths.repo.path, "run", "meeting-auto"] + args
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:\(Paths.home.path)/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        process.environment = env
+        process.environment = Self.childEnvironment
         let stdout = Pipe()
         process.standardOutput = stdout
         process.standardError = logHandle()

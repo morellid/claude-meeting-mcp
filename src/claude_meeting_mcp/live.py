@@ -15,7 +15,6 @@ meeting record still come from the final transcription.
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import logging
 import os
@@ -24,6 +23,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 # up with two channels and leaves memory for the call app (measured 2026-11-09).
 LIVE_MODEL = "small"
 CHUNK_SECONDS = 10.0
+# Until the language is known, chunks are 30 s: Whisper detects the language on a
+# 30 s window, and on 10 s of call audio it picked Welsh and Russian (2026-11-09).
+DETECT_SECONDS = 30.0
+# Davide's calls are in English or Italian, so detection only chooses between the
+# two: on room noise before anyone joined it picked Nynorsk (2026-11-11). A calendar
+# meeting means probably English, so Italian then needs this share of EN+IT.
+MEETING_IT_SHARE = 0.8
+# A call that starts this much before its calendar event still matches it.
+MEETING_LOOKAHEAD = timedelta(minutes=15)
 # audiocap writes system audio (the others) left and the mic (Davide) right.
 SPEAKERS = ("Remote", "Davide")
 # The worker exits on its own when the WAV stops growing this long: its parent
@@ -47,7 +56,10 @@ SPEAKERS = ("Remote", "Davide")
 ORPHAN_SECONDS = 120.0
 WAV_HEADER_BYTES = 44
 
-Transcribe = Callable[[np.ndarray], list[dict]]
+# (16 kHz mono audio, language) -> segments
+Transcribe = Callable[[np.ndarray, str], list[dict]]
+# 16 kHz mono audio -> Whisper's probability for each language
+Detect = Callable[[np.ndarray], dict[str, float]]
 
 
 def live_path(wav_path: str, transcripts_dir: Path = TRANSCRIPTIONS_DIR) -> Path:
@@ -68,13 +80,12 @@ def cut_point(audio: np.ndarray, sr: int, search_seconds: float = 2.0) -> int:
     return start + int(np.argmin(energy)) * frame + frame // 2
 
 
-def whisper_small(audio: np.ndarray, language: str | None = None) -> list[dict]:
-    """Transcribe 16 kHz mono audio with the small MLX Whisper.
+def whisper_small(audio: np.ndarray, language: str) -> list[dict]:
+    """Transcribe 16 kHz mono audio with the small MLX Whisper, in `language`.
 
     One greedy pass (temperature 0, no fallback): on real call audio the fallback
     re-decoded hallucination loops until a 10 s chunk took longer than 10 s and the
-    worker fell behind the call (2026-11-09). `language` None = detect per chunk,
-    which on short noisy chunks can pick the wrong language.
+    worker fell behind the call (2026-11-09).
     """
     import mlx_whisper
 
@@ -99,6 +110,44 @@ def whisper_small(audio: np.ndarray, language: str | None = None) -> list[dict]:
     ]
 
 
+def whisper_language_probs(audio: np.ndarray) -> dict[str, float]:
+    """Whisper's language probabilities on the first 30 s, computed as mlx_whisper does."""
+    import mlx.core as mx
+    from mlx_whisper.audio import N_FRAMES, N_SAMPLES, log_mel_spectrogram, pad_or_trim
+    from mlx_whisper.transcribe import ModelHolder
+
+    from . import _mlx
+
+    _mlx.cap_cache()
+    try:
+        model = ModelHolder.get_model(get_mlx_model_id(LIVE_MODEL), mx.float16)
+        mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
+        _, probs = model.detect_language(pad_or_trim(mel, N_FRAMES, axis=-2).astype(mx.float16))
+    finally:
+        _mlx.clear_cache()
+    return probs
+
+
+def pick_language(probs: dict[str, float], meeting: bool) -> str:
+    """English or Italian, whatever else Whisper thinks; a meeting leans to English."""
+    en, it = probs.get("en", 0.0), probs.get("it", 0.0)
+    if en + it == 0:
+        return "en"
+    return "it" if it / (en + it) > (MEETING_IT_SHARE if meeting else 0.5) else "en"
+
+
+def calendar_meeting(now: datetime) -> bool:
+    """Whether a calendar event (not a reminder calendar) overlaps the next minutes."""
+    from .auto import _gws, pick_event
+
+    try:
+        agenda = _gws("calendar", "+agenda", "--today", "--format", "json").get("events", [])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        logger.warning("Calendar not readable: no language hint", exc_info=True)
+        return False
+    return pick_event(agenda, now, now + MEETING_LOOKAHEAD) is not None
+
+
 class LiveTranscriber:
     """Turns a growing stereo WAV into appended transcript lines, one chunk per step."""
 
@@ -109,11 +158,18 @@ class LiveTranscriber:
         transcribe: Transcribe = whisper_small,
         sample_rate: int = 48000,
         chunk_seconds: float = CHUNK_SECONDS,
+        language: str | None = None,
+        detect: Detect = whisper_language_probs,
+        meeting: bool = False,
     ) -> None:
         self._wav = wav_path
         self._out = out_path
         self._transcribe = transcribe
+        self._detect = detect
+        self._meeting = meeting
         self._chunk_seconds = chunk_seconds
+        # None until detected on the first chunk with speech, then fixed for the call.
+        self._language = language
         # sample_rate is only a fallback: the source switches to the header's rate.
         self._source = FileAudioSource(wav_path, sample_rate=sample_rate, channels=2)
         self._buf = np.zeros((0, 2), dtype=np.float32)
@@ -123,7 +179,8 @@ class LiveTranscriber:
 
     def step(self) -> bool:
         """Transcribe one chunk if a full one is buffered. False when waiting for audio."""
-        while len(self._buf) < self._chunk_seconds * self._source.get_sample_rate():
+        seconds = self._chunk_seconds if self._language else DETECT_SECONDS
+        while len(self._buf) < seconds * self._source.get_sample_rate():
             frames = self._source.get_new_frames()
             if frames is None:
                 return False
@@ -131,7 +188,7 @@ class LiveTranscriber:
             self._buf = np.concatenate([self._buf, frames])
 
         sr = self._source.get_sample_rate()
-        cut = cut_point(self._buf[: int(self._chunk_seconds * sr)].mean(axis=1), sr)
+        cut = cut_point(self._buf[: int(seconds * sr)].mean(axis=1), sr)
         chunk, self._buf = self._buf[:cut], self._buf[cut:]
         offset = self._pos / sr
         self._pos += cut
@@ -141,7 +198,16 @@ class LiveTranscriber:
             audio = chunk[:, channel]
             if _channel_is_silent(audio):
                 continue
-            for seg in self._transcribe(_resample_to_16k(audio, sr)):
+            audio = _resample_to_16k(audio, sr)
+            if self._language is None:
+                self._language = pick_language(self._detect(audio), self._meeting)
+                logger.info(
+                    "Language: %s (calendar meeting: %s), kept for the rest of the call",
+                    self._language,
+                    self._meeting,
+                )
+            segments = self._transcribe(audio, self._language)
+            for seg in segments:
                 rows.append(
                     {
                         "start": round(offset + seg["start"], 2),
@@ -227,7 +293,9 @@ def read_live(
         "transcribed_until_seconds": round(transcribed_until),
         "recording_active": False,
         "note": "Rough live transcript (small local model): names and numbers may be wrong. "
-        "'Davide' is the mic, 'Remote' everyone else in the call.",
+        "'Remote' is the call audio, 'Davide' the mic. The mic also picks up people "
+        "in the room with Davide, and without headphones it echoes Remote lines: "
+        "a 'Davide' line that repeats a 'Remote' one a few seconds apart is echo.",
     }
     wav = recordings_dir / f"{meeting_id}.wav"
     try:
@@ -267,7 +335,10 @@ def stop(proc: subprocess.Popen | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live transcript of a recording in progress")
     parser.add_argument("wav", help="The WAV audiocap is writing")
-    parser.add_argument("--language", help="Language of the call (e.g. en, it). Default: detect")
+    parser.add_argument(
+        "--language",
+        help="Language of the call (e.g. en, it). Default: EN or IT, detected on the first 30 s",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="meeting-live: %(message)s")
     logging.getLogger("claude_meeting_mcp.transcriber").setLevel(logging.WARNING)  # per-chunk noise
@@ -277,9 +348,12 @@ def main() -> None:
     # only state is the append-only JSONL; at most the chunk in flight is lost.
     out = live_path(args.wav)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # Before the calendar lookup (up to gws's 60 s timeout): read_live must serve this
+    # meeting, not the previous one, from the start.
+    out.touch()
     logger.info("%s -> %s", args.wav, out)
-    transcribe = functools.partial(whisper_small, language=args.language)
-    LiveTranscriber(args.wav, out, transcribe=transcribe).run(threading.Event())
+    meeting = args.language is None and calendar_meeting(datetime.now().astimezone())
+    LiveTranscriber(args.wav, out, language=args.language, meeting=meeting).run(threading.Event())
 
 
 if __name__ == "__main__":
